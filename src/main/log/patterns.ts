@@ -33,11 +33,37 @@
  * need neither flag. Do not add one.
  *
  *
- * THE `[SCENE] Set Source` LINE DOES NOT EXIST
- * -------------------------------------------
- * An earlier design guessed that OBS-relevant scene changes would show up in
- * Client.txt as a `[SCENE] Set Source` line. They do not - that string appears
- * NOWHERE in a real log. Nothing in this project may depend on it.
+ * THE `[SCENE] Set Source` LINE EXISTS, AND IS STILL NOT A ZONE SIGNAL
+ * -------------------------------------------------------------------
+ * CORRECTION. An earlier version of this comment asserted that the string
+ * `[SCENE] Set Source` "appears NOWHERE in a real log". That was FACTUALLY
+ * WRONG and it is recorded here so nobody re-derives the same mistake. It
+ * appears 16,898 times in the 375,087-line reference Client.txt, shaped like
+ * this (verbatim - note the value is bracketed and there is NO `": "` marker,
+ * this is not a system message):
+ *
+ * ```text
+ * 2025/06/19 16:15:23 9696796 e03447a5 [INFO Client 32648] [SCENE] Set Source [The Twilight Strand]
+ * ```
+ *
+ * It reads like a zone signal. It is not usable as one. Observed distribution
+ * of the bracketed value across those 16,898 lines:
+ *
+ * ```text
+ *   8,320  [(null)]              <- no zone at all
+ *     514  [(unknown)]           <- no zone at all
+ *   2,528  [Crucible Hideout]
+ *     374  [Karui Shores]
+ *     ...  364 further values, long tail (368 distinct values in all)
+ * ```
+ *
+ * Over HALF of all occurrences (8,834 of 16,898) name no zone whatsoever, and
+ * the named remainder is dominated by whatever the player idles in rather than
+ * by transitions. {@link ZONE_ENTERED} (8,065 occurrences) and
+ * {@link AREA_GENERATED} (8,070) already carry the same information completely,
+ * and the first of the two is system-gated. There is nothing here to win.
+ *
+ * Do not re-litigate this: the line is real, it was measured, and it lost.
  *
  * The supported way to discover a new pattern is the `npm run tail:debug` CLI
  * (`src/main/tools/tail-debug.ts`): it tails a real Client.txt and prints every
@@ -149,8 +175,13 @@ export const SYSTEM_MARKER = /^: /
 // ---------------------------------------------------------------------------
 
 /**
- * A character died. GATED ON {@link SYSTEM_MARKER} - never run this against a
- * body that did not carry the marker.
+ * A character was killed BY THE GAME. GATED ON {@link SYSTEM_MARKER} - never run
+ * this against a body that did not carry the marker.
+ *
+ * This is only ONE of the two ways a character dies; the other is
+ * {@link SUICIDE}. Both produce a `DeathEvent`, discriminated by
+ * `DeathEvent.cause` - `'slain'` here, `'suicide'` there. 348 occurrences in the
+ * 375,087-line reference log, all 348 matched by this pattern.
  *
  * Written against (marker already stripped, so the body is
  * `FyascoWorbinTime has been slain.`):
@@ -175,6 +206,81 @@ export const SYSTEM_MARKER = /^: /
  * is ever added, the data is already here - do not re-shape the regex for it.
  */
 export const DEATH = /^(\S+) has been slain(?: by (.+))?\.$/
+
+/**
+ * A character killed ITSELF - this is PoE's `/kill` chat command. GATED ON
+ * {@link SYSTEM_MARKER}, for exactly the same reason as {@link DEATH}: the
+ * sentence is trivially typeable into global chat, and the marker is the only
+ * thing that tells the two apart.
+ *
+ * Written against (marker already stripped, so the body is
+ * `LargeThumbThomasReturns has committed suicide.`):
+ * ```text
+ * 2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] : LargeThumbThomasReturns has committed suicide.
+ * ```
+ *
+ * Group 1 = the character's name. 7 occurrences in the 375,087-line reference
+ * log, all 7 matched by this pattern - which is exactly why it earns a regex
+ * rather than a heuristic: seven lines in thirteen months is far too rare to
+ * ever be noticed going wrong.
+ *
+ * `^(\S+)` for the same reason as {@link DEATH}: PoE names have no spaces, so a
+ * lazy `.+?` would let `"lol Bob has committed suicide."` report `"lol Bob"` as
+ * dead. Fully anchored at both ends for the same reason too.
+ *
+ * NO `(?: by (.+))?` CLAUSE, unlike {@link DEATH}. `/kill` has no killer, and
+ * the speculative clause on `DEATH` exists only because other client versions
+ * are reported to log one for real deaths. Nothing suggests this sentence has a
+ * variant, so it gets no speculative slack.
+ *
+ * WHAT THIS IS FOR: a suicide is a real death and counts for stats, but it is
+ * DELIBERATE and must never produce a clip - `/kill` is how you leave a map
+ * instantly or reset a boss, so the "highlight" would be thirty seconds of
+ * nothing. The parser emits it as a `DeathEvent` with `cause: 'suicide'` and the
+ * replay clipper is the single consumer that filters on that. See `DeathCause`
+ * in src/shared/events.ts.
+ */
+export const SUICIDE = /^(\S+) has committed suicide\.$/
+
+/**
+ * A character gained a level. GATED ON {@link SYSTEM_MARKER} - this sentence is
+ * as chat-shaped as the death ones, and letting a stranger in global chat name
+ * the character we think we are playing would be worse than a fake death.
+ *
+ * Written against (marker already stripped, so the body is
+ * `LargeThumbThomasReturns (Marauder) is now level 2`):
+ * ```text
+ * 2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : LargeThumbThomasReturns (Marauder) is now level 2
+ * ```
+ *
+ * Groups: 1 = character name, 2 = class, 3 = new level. 585 occurrences in the
+ * 375,087-line reference log, all 585 matched by this pattern.
+ *
+ * NO TRAILING PERIOD. Unlike {@link DEATH}, {@link SUICIDE} and
+ * {@link ZONE_ENTERED}, this sentence ends on the digits - hence `(\d+)$` and
+ * not `(\d+)\.$`. That difference is load-bearing twice over: it is what makes
+ * this pattern mutually exclusive with the three period-terminated ones, and it
+ * is the single easiest thing to get wrong when writing this from memory.
+ *
+ * `\(([^)]+)\)` rather than `\((\S+)\)` for the class: every value observed in
+ * the reference log is one word (Marauder, Berserker, Slayer, Duelist,
+ * Elementalist, Witch, Ranger - base classes BEFORE ascending, ascendancies
+ * after), but a negated class costs nothing, cannot backtrack past the closing
+ * paren, and does not bake a "class names have no spaces" assumption into the
+ * regex that the type in src/shared/events.ts explicitly refuses to make.
+ *
+ * `(\d+)` unbounded, not `([1-9][0-9]?|100)`: PoE 1 caps at 100 today, and a
+ * pattern that silently stops matching if that ever changes is a worse failure
+ * than a number the caller has to sanity-check.
+ *
+ * WHY THIS EXISTS AT ALL: this is the ONLY line in Client.txt that names a
+ * character AND identifies it as the one being played, so it is the sole basis
+ * for auto-detecting the active character. It is also SPARSE - the reference log
+ * has 585 of them across thirteen months, and a level-98 character can play for
+ * weeks without producing one. Anything derived from it MUST be persisted; see
+ * `LevelUpEvent` and `ActiveCharacter` in src/shared/events.ts.
+ */
+export const LEVEL_UP = /^(\S+) \(([^)]+)\) is now level (\d+)$/
 
 /**
  * The player entered a new area. GATED ON {@link SYSTEM_MARKER} - a player

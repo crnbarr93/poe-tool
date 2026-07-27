@@ -43,7 +43,9 @@ import os from 'node:os'
 import path from 'node:path'
 
 import type {
+  ActiveCharacter,
   DeathEvent,
+  LevelUpEvent,
   PoeEvent,
   PoeEventMap,
   UnmatchedLine,
@@ -52,7 +54,12 @@ import type {
 import { validateSettings, type AppSettings } from '../src/shared/settings'
 import { TypedEmitter } from '../src/main/events/typed-emitter'
 import { LogReader, type LogReadResult } from '../src/main/log/log-reader'
-import { LogWatcher, type LogReaderLike, type LogWatcherOptions } from '../src/main/log/log-watcher'
+import {
+  LogWatcher,
+  type CharacterSource,
+  type LogReaderLike,
+  type LogWatcherOptions
+} from '../src/main/log/log-watcher'
 
 // ---------------------------------------------------------------------------
 // Fixtures - verbatim real Client.txt lines
@@ -71,6 +78,15 @@ const GENERATING =
 /** Player chat that mimics a death line. No `": "` marker => must never become an event. */
 const SPOOF =
   '2026/07/26 19:26:40 1018421337 cffb0658 [INFO Client 50396] TrollMcSpoof: FyascoWorbinTime has been slain.'
+/**
+ * The line that establishes who "self" is - verbatim from the reference log (the
+ * last of its 585 level-ups). Note there is no trailing period on this one.
+ */
+const LEVEL_UP_SELF =
+  '2026/07/26 13:26:59 996840125 cffb0658 [INFO Client 53252] : FyascoWorbinTime (Elementalist) is now level 92'
+/** A level-up naming somebody else. Same shape; a different answer. */
+const LEVEL_UP_OTHER =
+  '2026/07/26 19:30:47 1018667906 cffb0658 [INFO Client 50396] : GrumpyTotemDad (Marauder) is now level 2'
 
 const POLL = 500
 
@@ -88,9 +104,18 @@ let statuses: WatcherStatus[] = []
 let unmatched: UnmatchedLine[] = []
 let selfDeaths: DeathEvent[] = []
 let deaths: DeathEvent[] = []
+let levelUps: LevelUpEvent[] = []
 let errors: unknown[] = []
 
 let settings: AppSettings
+
+/**
+ * The character source the watcher under test is wired to.
+ *
+ * Set to `null` by a test that wants a watcher with NO source at all - the
+ * "nothing is known" state a fresh install boots into.
+ */
+let characters: CharacterSource | null
 
 beforeEach(async () => {
   vi.useFakeTimers({
@@ -111,14 +136,19 @@ beforeEach(async () => {
   unmatched = []
   selfDeaths = []
   deaths = []
+  levelUps = []
   errors = []
   bus.on('event', (event) => events.push(event))
   bus.on('watcher-status', (status) => statuses.push(status))
   bus.on('unmatched', (line) => unmatched.push(line))
   bus.on('death', (death) => deaths.push(death))
   bus.on('death:self', (death) => selfDeaths.push(death))
+  bus.on('level-up', (event) => levelUps.push(event))
 
   settings = makeSettings({ logPath })
+  // Most tests are not about detection, so the default source already knows who we
+  // are - the same position the app is in once a character has ever been detected.
+  characters = new StubCharacters({ override: SELF_NAME })
 })
 
 afterEach(async () => {
@@ -128,6 +158,14 @@ afterEach(async () => {
   await fs.rm(dir, { recursive: true, force: true })
 })
 
+/**
+ * A settings snapshot.
+ *
+ * `name` writes the LEGACY `character.name` key, which `validateSettings` migrates
+ * into `character.override`. The watcher no longer reads either of them - resolving
+ * a name is the character source's job - so this survives only to give the
+ * reconfiguration tests a settings change that must NOT restart the tail.
+ */
 function makeSettings(over: {
   logPath?: string | null
   pollIntervalMs?: number
@@ -147,6 +185,11 @@ function makeSettings(over: {
  *
  * Whatever reader the test asks for is wrapped in a {@link TrackingReader}, so
  * {@link settle} can tell when a tick has actually finished. See the file header.
+ *
+ * The character source is spread in conditionally rather than passed as
+ * `characters: characters ?? undefined`, because `exactOptionalPropertyTypes` makes
+ * an explicit `undefined` a type error on an optional property - and "no source at
+ * all" is a state a test genuinely needs to construct.
  */
 function createWatcher(overrides?: Partial<LogWatcherOptions>): LogWatcher {
   const makeInner = overrides?.createReader ?? ((target: string) => new LogReader(target))
@@ -154,6 +197,7 @@ function createWatcher(overrides?: Partial<LogWatcherOptions>): LogWatcher {
     bus,
     getSettings: () => settings,
     onError: (error) => errors.push(error),
+    ...(characters === null ? {} : { characters }),
     ...overrides,
     createReader: (target) => new TrackingReader(makeInner(target))
   }
@@ -248,6 +292,75 @@ function types(list: readonly PoeEvent[]): string[] {
 
 function statesOf(list: readonly WatcherStatus[]): string[] {
   return list.map((status) => status.state)
+}
+
+// ---------------------------------------------------------------------------
+// Test double for the character source
+// ---------------------------------------------------------------------------
+
+/**
+ * A stand-in for `CharacterTracker`, implementing the whole `CharacterSource`
+ * contract in twenty lines.
+ *
+ * A STUB RATHER THAN THE REAL TRACKER ON PURPOSE. These tests are about the
+ * WATCHER's half of the loop - that it asks for the name once per line, hands over
+ * every level-up in file order, and contains whatever the source does. Driving the
+ * real tracker here would drag a settings store into a file about tailing, and would
+ * make a bug in either component fail in both suites.
+ *
+ * It implements the documented priority (`ActiveCharacter`: override, else detected,
+ * else nothing) because the watcher's behaviour is defined in terms of the resolved
+ * answer, and a stub that resolved differently would be testing a contract nobody
+ * has.
+ */
+class StubCharacters implements CharacterSource {
+  /** Every level-up handed over, in the order it arrived. */
+  readonly seen: LevelUpEvent[] = []
+  /** How many times `active` was read - the "per line, not per tick" evidence. */
+  reads = 0
+
+  #override: string
+  #detected: LevelUpEvent | null = null
+
+  constructor(init: { override?: string } = {}) {
+    this.#override = init.override ?? ''
+  }
+
+  /** Simulates the user typing a name into the override field. */
+  setOverride(name: string): void {
+    this.#override = name
+  }
+
+  get active(): ActiveCharacter {
+    this.reads++
+    if (this.#override !== '') {
+      return { name: this.#override, className: null, level: null, source: 'override' }
+    }
+    const detected = this.#detected
+    if (detected === null) return { name: null, className: null, level: null, source: 'none' }
+    return {
+      name: detected.characterName,
+      className: detected.className,
+      level: detected.level,
+      source: 'detected'
+    }
+  }
+
+  handleLevelUp(event: LevelUpEvent): void {
+    this.seen.push(event)
+    this.#detected = event
+  }
+}
+
+/** A source that fails at everything, to prove neither half can kill the tail loop. */
+class BrokenCharacters implements CharacterSource {
+  get active(): ActiveCharacter {
+    throw new Error('character source exploded on read')
+  }
+
+  handleLevelUp(): void {
+    throw new Error('character source exploded on write')
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -450,10 +563,14 @@ describe('LogWatcher tailing', () => {
   })
 
   it('picks up a changed character name without restarting the tail', async () => {
+    const source = new StubCharacters({ override: SELF_NAME })
+    characters = source
     const w = createWatcher()
     await w.start()
 
-    settings = makeSettings({ name: 'GrumpyTotemDad' })
+    // The user retypes the override mid-session (group play, or an alt swap). The
+    // watcher holds no copy of the name, so this lands on the very next line.
+    source.setOverride('GrumpyTotemDad')
     await append(`${PARTY_SLAIN}\n`)
     await poll()
 
@@ -463,6 +580,163 @@ describe('LogWatcher tailing', () => {
     expect(status.state).toBe('tailing')
     if (status.state !== 'tailing') throw new Error('expected tailing')
     expect(status.linesRead).toBe(1)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Character detection
+// ---------------------------------------------------------------------------
+
+/**
+ * The loop that makes auto-detection work: the watcher asks the character source
+ * who "me" is for each line, and hands back the level-ups that change the answer.
+ *
+ * Every case here uses a single `poll()`, i.e. ONE read delivering ONE batch of
+ * lines. That is the whole point - if the name were sampled once per tick instead
+ * of once per line, every one of these would still pass with the level-up in a
+ * separate batch and fail here.
+ */
+describe('LogWatcher character detection', () => {
+  it('lets a level-up mid-stream flip isSelf for the deaths that FOLLOW it', async () => {
+    const source = new StubCharacters() // nothing configured, nothing detected
+    characters = source
+
+    const w = createWatcher()
+    await w.start()
+
+    // One batch, in file order: a death, the level-up that identifies us, a death.
+    await append(`${SLAIN}\n${LEVEL_UP_SELF}\n${SLAIN}\n`)
+    await poll()
+
+    expect(types(events)).toEqual(['death', 'level-up', 'death'])
+    // The FIRST death predates any evidence of who we are. `false` is not a bug
+    // here, it is the honest answer: at that instant we genuinely did not know, and
+    // a level-up cannot reach backwards and reclassify a line already parsed.
+    expect(deaths.map((death) => death.isSelf)).toEqual([false, true])
+    // ...so exactly one of them is the clipper's business.
+    expect(selfDeaths).toHaveLength(1)
+    expect(selfDeaths[0]).toBe(deaths[1])
+    expect(source.seen.map((event) => event.characterName)).toEqual([SELF_NAME])
+  })
+
+  it('leaves a death before any level-up alone and keeps the clipper idle', async () => {
+    characters = new StubCharacters()
+
+    const w = createWatcher()
+    await w.start()
+
+    await append(`${SLAIN}\n${PARTY_SLAIN}\n`)
+    await poll()
+
+    // Nothing is known, so nothing is claimed - for OUR name as much as anyone's.
+    expect(deaths).toHaveLength(2)
+    expect(deaths.every((death) => !death.isSelf)).toBe(true)
+    expect(selfDeaths).toEqual([])
+    expect(errors).toEqual([])
+    expect(w.status.state).toBe('tailing')
+  })
+
+  it('resolves the character once per LINE, not once per tick', async () => {
+    const source = new StubCharacters({ override: SELF_NAME })
+    characters = source
+
+    const w = createWatcher()
+    await w.start()
+    const beforeBatch = source.reads
+
+    // Four lines, one read: one resolution each, including the ones that turn out
+    // to match nothing (the parser is asked before it knows what the line is).
+    await append(`${GENERATING}\n${ENTERED}\n${SPOOF}\n${SLAIN}\n`)
+    await poll()
+
+    expect(source.reads - beforeBatch).toBe(4)
+  })
+
+  it('learns from BACKLOG lines, so a rediscovered log still identifies us', async () => {
+    // The level-up that names the player may be the only one for weeks (they are
+    // sparse), and it can perfectly well sit in bytes that existed before we
+    // attached. `backlog` suppresses SIDE EFFECTS; it must not suppress LEARNING.
+    const later = path.join(dir, 'Later.txt')
+    settings = makeSettings({ logPath: later })
+    const source = new StubCharacters()
+    characters = source
+
+    const w = createWatcher()
+    await w.start()
+    expect(w.status.state).toBe('file-missing')
+
+    await fs.writeFile(later, `${SLAIN}\n${LEVEL_UP_SELF}\n${SLAIN}\n`)
+    await poll()
+
+    expect(source.seen).toHaveLength(1)
+    expect(deaths.map((death) => death.isSelf)).toEqual([false, true])
+    // ...and every one of them is still suppressible, detection or not.
+    expect(events.every((event) => event.backlog)).toBe(true)
+    expect(selfDeaths.every((death) => death.backlog)).toBe(true)
+  })
+
+  it('publishes level-up on its own channel and on event, for anyone', async () => {
+    characters = new StubCharacters({ override: SELF_NAME })
+
+    const w = createWatcher()
+    await w.start()
+
+    await append(`${LEVEL_UP_SELF}\n${LEVEL_UP_OTHER}\n`)
+    await poll()
+
+    // No `level-up:self` filtering anywhere: a level-up is what ESTABLISHES who
+    // self is, so filtering it on the current answer could never bootstrap.
+    expect(levelUps.map((event) => event.characterName)).toEqual([SELF_NAME, 'GrumpyTotemDad'])
+    expect(types(events)).toEqual(['level-up', 'level-up'])
+    expect(deaths).toEqual([])
+
+    const first = levelUps[0]
+    expect(first?.className).toBe('Elementalist')
+    expect(first?.level).toBe(92)
+    expect(first?.backlog).toBe(false)
+  })
+
+  it('runs with no character source at all: isSelf false, clipper idle, nothing thrown', async () => {
+    // A watcher wired without a source cannot resolve anything - and must degrade
+    // to "not me" rather than to a guess, because the wrong guess sprays clips of
+    // other people's deaths. The rest of the pipeline carries on regardless.
+    characters = null
+
+    const w = createWatcher()
+    await w.start()
+
+    await append(`${SLAIN}\n${LEVEL_UP_SELF}\n${SLAIN}\n`)
+    await poll()
+
+    expect(types(events)).toEqual(['death', 'level-up', 'death'])
+    expect(deaths.every((death) => !death.isSelf)).toBe(true)
+    expect(selfDeaths).toEqual([])
+    expect(errors).toEqual([])
+    expect(w.status.state).toBe('tailing')
+  })
+
+  it('contains a character source that throws on both halves', async () => {
+    characters = new BrokenCharacters()
+
+    const w = createWatcher()
+    await w.start()
+
+    await append(`${SLAIN}\n${LEVEL_UP_SELF}\n${SLAIN}\n`)
+    await poll()
+
+    // Three failed reads (one per line) plus one failed ingest, all reported and
+    // none of them propagated - this runs inside a setInterval callback, where an
+    // escape takes the main process down.
+    expect(errors).toHaveLength(4)
+    // A broken detector costs `isSelf`, and nothing else.
+    expect(types(events)).toEqual(['death', 'level-up', 'death'])
+    expect(deaths.every((death) => !death.isSelf)).toBe(true)
+    expect(w.status.state).toBe('tailing')
+
+    // ...and the loop is still healthy on the next beat.
+    await append(`${ENTERED}\n`)
+    await poll()
+    expect(types(events)).toEqual(['death', 'level-up', 'death', 'zone-entered'])
   })
 })
 
@@ -1022,6 +1296,42 @@ describe('LogWatcher.replay', () => {
     expect(events.every((event) => event.backlog)).toBe(true)
     expect(selfDeaths.every((death) => death.backlog)).toBe(true)
     expect(unmatched).toHaveLength(1)
+  })
+
+  it('feeds the character tracker exactly as the live tail does', async () => {
+    // `tail:debug` exists to tell the user what the app WOULD have done with their
+    // real log. If replay resolved the character differently - or not at all - it
+    // would report `isSelf: false` on every death in a file full of their own, and
+    // the one tool meant to verify the pipeline would be lying about it.
+    await fs.writeFile(logPath, `${SLAIN}\n${LEVEL_UP_SELF}\n${SLAIN}\n${PARTY_SLAIN}\n`)
+    const source = new StubCharacters()
+    characters = source
+
+    const w = createWatcher()
+    const result = await w.replay(logPath)
+
+    expect(result.status).toBe('ok')
+    expect(result.linesRead).toBe(4)
+    expect(source.seen.map((event) => event.characterName)).toEqual([SELF_NAME])
+    // Same answer, in the same order, as the live-tail test above.
+    expect(deaths.map((death) => death.isSelf)).toEqual([false, true, false])
+    // Still a replay: every one of them is suppressible, so not a single clip.
+    expect(selfDeaths).toHaveLength(1)
+    expect(selfDeaths.every((death) => death.backlog)).toBe(true)
+  })
+
+  it('replays with no character source without resolving or crashing', async () => {
+    await fs.writeFile(logPath, `${LEVEL_UP_SELF}\n${SLAIN}\n`)
+    characters = null
+
+    const w = createWatcher()
+    const result = await w.replay(logPath)
+
+    expect(result.status).toBe('ok')
+    expect(result.eventsPublished).toBe(2)
+    expect(deaths.every((death) => !death.isSelf)).toBe(true)
+    expect(selfDeaths).toEqual([])
+    expect(errors).toEqual([])
   })
 
   it('emits no watcher-status and does not start polling', async () => {

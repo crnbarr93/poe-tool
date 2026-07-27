@@ -42,6 +42,31 @@ function describeClipZone(clip: ClipRecord): string {
   return `${name} · ${level}`
 }
 
+/**
+ * The `cause` chip.
+ *
+ * In practice every row says `slain`, because a `/kill` is deliberate and the clipper
+ * drops it before OBS is ever asked (see `DeathCause`). Showing it anyway is what makes
+ * that rule LEGIBLE rather than folklore: a user who types `/kill`, gets no clip, and
+ * then reads a list where every clip is explicitly labelled `slain` can see the pattern.
+ * And if a `suicide` ever does appear here - a future manual "clip that" button, a change
+ * of mind - the row explains itself instead of contradicting the documentation.
+ */
+function CauseTag({ cause }: { readonly cause: ClipRecord['cause'] }): ReactElement {
+  if (cause === 'suicide') {
+    return (
+      <span className="tag tag--idle" title="PoE's /kill command — deliberate, normally never clipped.">
+        /kill
+      </span>
+    )
+  }
+  return (
+    <span className="tag tag--bad" title="Killed by the game — the kind of death clips exist for.">
+      slain
+    </span>
+  )
+}
+
 function ClipRow({ clip }: { readonly clip: ClipRecord }): ReactElement {
   const placed = clip.moved && clip.finalPath !== null
   const location = clip.finalPath ?? clip.originalPath
@@ -53,6 +78,7 @@ function ClipRow({ clip }: { readonly clip: ClipRecord }): ReactElement {
         <span className={placed ? 'tag tag--ok' : 'tag tag--warn'}>
           {placed ? 'In library' : 'Left in OBS folder'}
         </span>
+        <CauseTag cause={clip.cause} />
         <span className="clip__zone">{describeClipZone(clip)}</span>
         {clip.characterName !== '' && <span className="clip__character">{clip.characterName}</span>}
       </div>
@@ -167,8 +193,10 @@ export function ClipsSection({
 
         {clips.length === 0 ? (
           <p className="feed__empty">
-            No clips yet. One appears here each time you die with clipping enabled and the OBS
-            replay buffer running — including any that could not be filed.
+            No clips yet. One appears here each time you are slain with clipping enabled and the
+            OBS replay buffer running — including any that could not be filed. Deaths from{' '}
+            <span className="mono">/kill</span> are deliberately never clipped, and a clip is only
+            taken for the character shown in the Character section above.
           </p>
         ) : (
           <ul className="feed__list feed__list--clips">

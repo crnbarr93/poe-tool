@@ -118,9 +118,42 @@ describe('SettingsStore.load - degradation to defaults', () => {
   })
 
   it('survives a UTF-8 BOM, which Notepad adds to any file it saves', () => {
-    writeSettingsFile(`\uFEFF${JSON.stringify({ character: { name: 'Notepadded' } })}`)
+    writeSettingsFile(`\uFEFF${JSON.stringify({ character: { override: 'Notepadded' } })}`)
 
-    expect(makeStore().load().character.name).toBe('Notepadded')
+    expect(makeStore().load().character.override).toBe('Notepadded')
+  })
+})
+
+describe('SettingsStore.load - the pre-0.2 character.name migration', () => {
+  // `validateSettings` carries a non-empty legacy `character.name` into
+  // `character.override`. Losing it would make `isSelf` false everywhere and stop death
+  // clipping with no error anywhere, so the contract is pinned here rather than left to
+  // the reader of settings.ts.
+  it('migrates a legacy character.name into character.override', () => {
+    writeSettingsFile(JSON.stringify({ character: { name: 'Exile' } }))
+
+    const loaded = makeStore().load()
+
+    expect(loaded.character.override).toBe('Exile')
+    expect('name' in loaded.character).toBe(false)
+  })
+
+  it('lets an explicit override win over the stale legacy key', () => {
+    writeSettingsFile(JSON.stringify({ character: { name: 'Stale', override: 'Current' } }))
+
+    expect(makeStore().load().character.override).toBe('Current')
+  })
+
+  it('drops the legacy key on the next write, so it cannot come back', () => {
+    writeSettingsFile(JSON.stringify({ character: { name: 'Exile' } }))
+    const store = makeStore()
+    store.load()
+    store.save({})
+
+    const parsed: unknown = JSON.parse(readSettingsFile())
+
+    expect(parsed).toEqual(store.get())
+    expect(JSON.stringify(parsed)).not.toContain('"name"')
   })
 })
 
@@ -129,14 +162,20 @@ describe('SettingsStore.load - merging', () => {
     writeSettingsFile(
       JSON.stringify({
         log: { path: 'C:\\Games\\PoE\\logs\\Client.txt' },
-        character: { name: 'FyascoWorbinTime' }
+        character: { override: 'FyascoWorbinTime' }
       })
     )
 
     expect(makeStore().load()).toEqual({
       ...resolvedDefaults(),
       log: { path: 'C:\\Games\\PoE\\logs\\Client.txt', pollIntervalMs: 500 },
-      character: { name: 'FyascoWorbinTime' }
+      // The three `detected*` siblings must survive an override-only file untouched.
+      character: {
+        override: 'FyascoWorbinTime',
+        detected: null,
+        detectedClass: null,
+        detectedLevel: null
+      }
     })
   })
 
@@ -162,7 +201,7 @@ describe('SettingsStore.load - merging', () => {
     writeSettingsFile(
       JSON.stringify({
         log: { path: 12345, pollIntervalMs: 'not a number' },
-        character: { name: { first: 'Bob' } },
+        character: { override: { first: 'Bob' }, detected: 42, detectedLevel: 'ninety' },
         obs: { autoConnect: 'false' },
         clips: { enabled: null }
       })
@@ -172,7 +211,11 @@ describe('SettingsStore.load - merging', () => {
 
     expect(loaded.log.path).toBe(DEFAULT_SETTINGS.log.path)
     expect(loaded.log.pollIntervalMs).toBe(DEFAULT_SETTINGS.log.pollIntervalMs)
-    expect(loaded.character.name).toBe('')
+    expect(loaded.character.override).toBe('')
+    // A junk detection degrades to "never detected" rather than to a name no death can
+    // ever match.
+    expect(loaded.character.detected).toBeNull()
+    expect(loaded.character.detectedLevel).toBeNull()
     // "false" as a string is a legitimate hand-edit and is honoured.
     expect(loaded.obs.autoConnect).toBe(false)
     expect(loaded.clips.enabled).toBe(DEFAULT_SETTINGS.clips.enabled)
@@ -266,11 +309,11 @@ describe('SettingsStore.get', () => {
   })
 
   it('reflects the last load', () => {
-    writeSettingsFile(JSON.stringify({ character: { name: 'Exile' } }))
+    writeSettingsFile(JSON.stringify({ character: { override: 'Exile' } }))
     const store = makeStore()
     store.load()
 
-    expect(store.get().character.name).toBe('Exile')
+    expect(store.get().character.override).toBe('Exile')
   })
 
   it('reflects the last save', () => {
@@ -296,7 +339,12 @@ describe('SettingsStore.save', () => {
     first.load()
     const saved = first.save({
       log: { path: 'C:\\PoE\\logs\\Client.txt', pollIntervalMs: 250 },
-      character: { name: 'FyascoWorbinTime' },
+      character: {
+        override: 'FyascoWorbinTime',
+        detected: 'LargeThumbThomasReturns',
+        detectedClass: 'Berserker',
+        detectedLevel: 92
+      },
       obs: { host: '192.168.1.50', port: 4466, password: 'hunter2', autoConnect: false },
       clips: { enabled: false, libraryDir: 'E:\\Clips', debounceMs: 1500, writeSidecar: false }
     })
@@ -305,13 +353,13 @@ describe('SettingsStore.save', () => {
   })
 
   it('merges over the current settings, not over the defaults', () => {
-    writeSettingsFile(JSON.stringify({ character: { name: 'Exile' } }))
+    writeSettingsFile(JSON.stringify({ character: { override: 'Exile' } }))
     const store = makeStore()
     store.load()
 
     const saved = store.save({ obs: { port: 4460 } })
 
-    expect(saved.character.name).toBe('Exile')
+    expect(saved.character.override).toBe('Exile')
     expect(saved.obs.port).toBe(4460)
     expect(saved.obs.host).toBe(DEFAULT_SETTINGS.obs.host)
   })
@@ -319,12 +367,12 @@ describe('SettingsStore.save', () => {
   it('accumulates across successive calls', () => {
     const store = makeStore()
     store.load()
-    store.save({ character: { name: 'Exile' } })
+    store.save({ character: { override: 'Exile' } })
     store.save({ log: { pollIntervalMs: 200 } })
 
     const reloaded = makeStore().load()
 
-    expect(reloaded.character.name).toBe('Exile')
+    expect(reloaded.character.override).toBe('Exile')
     expect(reloaded.log.pollIntervalMs).toBe(200)
   })
 
@@ -346,9 +394,24 @@ describe('SettingsStore.save', () => {
   it('treats an explicitly undefined field as "no change"', () => {
     const store = makeStore()
     store.load()
-    store.save({ character: { name: 'Exile' } })
+    store.save({ character: { override: 'Exile' } })
 
-    expect(store.save({ character: { name: undefined } }).character.name).toBe('Exile')
+    expect(store.save({ character: { override: undefined } }).character.override).toBe('Exile')
+  })
+
+  it('distinguishes an undefined detection from an explicitly cleared one', () => {
+    // `null` is a real value for `detected` ("never detected"), not the absence of one.
+    // Collapsing the two would make clearing a detection impossible - or, worse, make a
+    // patch that names only `override` silently wipe the persisted detection that the
+    // sparse-level-up design depends on.
+    const store = makeStore()
+    store.load()
+    store.save({ character: { detected: 'Burgertrash', detectedClass: 'Slayer', detectedLevel: 84 } })
+
+    expect(store.save({ character: { override: 'OneLongToe' } }).character.detected).toBe(
+      'Burgertrash'
+    )
+    expect(store.save({ character: { detected: null } }).character.detected).toBeNull()
   })
 
   it('returns the unchanged settings for an empty patch', () => {
@@ -374,7 +437,7 @@ describe('SettingsStore.save', () => {
     const nested = join(dir, 'userData', 'poe-tool')
     const store = makeStore({ dir: nested })
     store.load()
-    store.save({ character: { name: 'Exile' } })
+    store.save({ character: { override: 'Exile' } })
 
     expect(readFileSync(join(nested, SETTINGS_FILE_NAME), 'utf8')).toContain('Exile')
   })
@@ -382,7 +445,7 @@ describe('SettingsStore.save', () => {
   it('writes human-editable JSON', () => {
     const store = makeStore()
     store.load()
-    store.save({ character: { name: 'Exile' } })
+    store.save({ character: { override: 'Exile' } })
 
     const contents = readSettingsFile()
 
@@ -407,7 +470,7 @@ describe('SettingsStore.save - atomicity', () => {
   it('leaves no .tmp file behind after a successful write', () => {
     const store = makeStore()
     store.load()
-    store.save({ character: { name: 'Exile' } })
+    store.save({ character: { override: 'Exile' } })
     store.save({ obs: { port: 4460 } })
 
     expect(readdirSync(dir)).toEqual([SETTINGS_FILE_NAME])
@@ -427,12 +490,12 @@ describe('SettingsStore.save - atomicity', () => {
   })
 
   it('overwrites an existing settings file rather than failing on the rename', () => {
-    writeSettingsFile(JSON.stringify({ character: { name: 'Old' } }))
+    writeSettingsFile(JSON.stringify({ character: { override: 'Old' } }))
     const store = makeStore()
     store.load()
-    store.save({ character: { name: 'New' } })
+    store.save({ character: { override: 'New' } })
 
-    expect(makeStore().load().character.name).toBe('New')
+    expect(makeStore().load().character.override).toBe('New')
     expect(readdirSync(dir)).toEqual([SETTINGS_FILE_NAME])
   })
 
@@ -444,7 +507,7 @@ describe('SettingsStore.save - atomicity', () => {
     const store = makeStore({ dir: blocked })
     const before = store.load()
 
-    expect(() => store.save({ character: { name: 'Exile' } })).toThrow()
+    expect(() => store.save({ character: { override: 'Exile' } })).toThrow()
     // Transactional: memory still agrees with disk, so the session cannot silently
     // diverge from the settings file.
     expect(store.get()).toEqual(before)

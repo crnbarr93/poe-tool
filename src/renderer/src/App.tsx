@@ -106,7 +106,13 @@ function ConfigApp({ api }: ConfigAppProps): ReactElement {
           commit={commit}
           flush={flush}
         />
-        <CharacterSection settings={settings} update={update} flush={flush} />
+        <CharacterSection
+          api={api}
+          settings={settings}
+          update={update}
+          commit={commit}
+          flush={flush}
+        />
         <ObsSection api={api} settings={settings} update={update} commit={commit} flush={flush} />
         <ClipsSection api={api} settings={settings} update={update} commit={commit} flush={flush} />
         <EventFeedSection api={api} />

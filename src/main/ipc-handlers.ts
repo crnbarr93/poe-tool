@@ -60,7 +60,7 @@
 
 import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron'
 
-import type { PoeEvent, PoeEventMap, WatcherStatus } from '../shared/events'
+import type { ActiveCharacter, PoeEvent, PoeEventMap, WatcherStatus } from '../shared/events'
 import {
   IPC_INVOKE,
   IPC_PUSH,
@@ -75,7 +75,19 @@ import {
 } from '../shared/ipc'
 import type { AppSettings, DeepPartial, ObsSettings } from '../shared/settings'
 import { PORT_MAX, PORT_MIN } from '../shared/settings'
+// A pure static, NOT a service: `CharacterTracker.suggestionsFrom` takes events and
+// returns names, touching no bus, no settings and no instance state. Importing it is
+// therefore not a violation of the ports doctrine above - the alternative, re-implementing
+// the tally here, would let the picker's idea of "names in your log" drift from the
+// detector's. The live tracker still arrives as {@link CharacterPort}, like every other
+// service.
+import { CharacterTracker } from './log/character-tracker'
 import { autodetectLogPath, fileExists } from './log/default-paths'
+// Also a pure function rather than a service, and imported for the same reason
+// `autodetectLogPath` is: it reads the filesystem and returns a value, holding no state
+// and touching nothing this file orchestrates. See the `character:suggestions` handler
+// for why the session ring buffer alone is not an acceptable source of names.
+import { scanLogForNameEvents } from './log/name-scan'
 
 // ---------------------------------------------------------------------------
 // Ring buffer sizes
@@ -103,6 +115,20 @@ export const RECENT_EVENTS_LIMIT = 200
  * with the filesystem would be worse than showing only this session's clips.
  */
 export const RECENT_CLIPS_LIMIT = 50
+
+/**
+ * The `character:active` answer when the tracker could not be asked.
+ *
+ * Deliberately the SAME value the tracker itself returns for "nothing configured and
+ * nothing ever detected", so a failure here degrades into a state the UI already handles
+ * loudly rather than into an invented one. Frozen because it is handed out by reference.
+ */
+const NO_CHARACTER: ActiveCharacter = Object.freeze({
+  name: null,
+  className: null,
+  level: null,
+  source: 'none'
+})
 
 // ---------------------------------------------------------------------------
 // Dependency ports
@@ -170,7 +196,7 @@ export interface WatcherPort {
    * CALLED UNCONDITIONALLY after every successful `settings:set`, so the CONTRACT is
    * that the implementation compares first and no-ops otherwise. That is the right
    * place for the comparison: the watcher knows that `log.path` and
-   * `log.pollIntervalMs` force a restart while `character.name` is re-read on every
+   * `log.pollIntervalMs` force a restart while `character.override` is re-read on every
    * tick and needs none. Duplicating that knowledge here would let the two drift, and
    * a needless restart costs the reader's carry buffer and its byte offset.
    *
@@ -179,6 +205,43 @@ export interface WatcherPort {
    * that safe.
    */
   readonly reconfigure: () => void | Promise<void>
+}
+
+/**
+ * What this file needs from `src/main/log/character-tracker.ts`. `CharacterTracker`
+ * satisfies it as-is - both members are methods on the class, and a method is assignable
+ * to a function-typed property.
+ *
+ * CALL THESE AS MEMBERS, never destructured. `CharacterTracker` keeps its state in `#`
+ * private fields, so a detached `active` reference would throw on `this` rather than
+ * quietly return the wrong answer.
+ *
+ * WHY THE RENDERER ASKS MAIN INSTEAD OF DERIVING THIS ITSELF
+ * ----------------------------------------------------------
+ * The renderer already receives the whole of `settings.character` from `settings:get`,
+ * so it could compute "override if non-empty, else detected" on its own. It must not.
+ * The resolution rule (and the `source` label the UI explains itself with) is the same
+ * one `DeathEvent.isSelf` is computed from; two implementations of it would eventually
+ * disagree, and the failure mode of that disagreement is a UI that says clipping is
+ * armed while the clipper sits idle. One owner, one answer - see `ActiveCharacter`.
+ */
+export interface CharacterPort {
+  /**
+   * The RESOLVED active character: override > detected > none. Cheap (it re-reads the
+   * in-memory settings), side-effect free, and documented as never throwing.
+   */
+  readonly active: () => ActiveCharacter
+  /**
+   * Re-resolve and announce `character-changed` if the answer moved.
+   *
+   * MUST be called after a `settings:set` that touched `settings.character`, because
+   * the tracker learns about a typed override only by being told to look again: it
+   * subscribes to `level-up`, not to the settings store. Without this call the override
+   * still takes effect for `isSelf` (the watcher re-reads it per line) but the UI never
+   * hears about it, so the "no character detected" warning would stay on screen after
+   * the user had just fixed it.
+   */
+  readonly refreshOverride: () => void
 }
 
 /**
@@ -207,6 +270,7 @@ export interface IpcHandlerDeps {
   readonly obs: ObsPort
   readonly clipper: ClipperPort
   readonly watcher: WatcherPort
+  readonly characters: CharacterPort
   /**
    * The window to push to, or null/undefined when there is none.
    *
@@ -287,11 +351,31 @@ function optionalBoolean(value: unknown): boolean | undefined {
 /**
  * Rebuilds an arbitrary renderer payload as a well-typed {@link DeepPartial} patch.
  *
- * Only the twelve known fields survive; everything else - extra keys, prototype
- * pollution attempts, functions, nested junk - is dropped on the floor. A field whose
- * value has the wrong type becomes `undefined`, which `applySettingsPatch` reads as
- * "no change" rather than "reset to default", so a garbled patch can never silently
- * wipe a setting the user did not touch.
+ * Only the ten known fields survive; everything else - extra keys, prototype pollution
+ * attempts, functions, nested junk - is dropped on the floor. A field whose value has
+ * the wrong type becomes `undefined`, which `applySettingsPatch` reads as "no change"
+ * rather than "reset to default", so a garbled patch can never silently wipe a setting
+ * the user did not touch.
+ *
+ * `character.override` IS THE ONLY WRITEABLE HALF OF `character`
+ * -------------------------------------------------------------
+ * `detected`, `detectedClass` and `detectedLevel` are deliberately absent, so a
+ * `settings:set` can never write them. Two reasons, and the second is the one that
+ * actually bites:
+ *
+ *  1. They are not the user's to set. They record what was read off a `... is now level
+ *     N` line; a renderer that could write them could forge a detection that no log line
+ *     supports, and every subsequent death would be attributed on that basis.
+ *  2. THE RENDERER'S COPY IS ROUTINELY STALE. `useSettingsController` sends the whole
+ *     settings object as its patch, and a level-up detected in main a second ago is not
+ *     in the copy the renderer is holding. Letting those three fields through would mean
+ *     a user editing an unrelated field silently rolls the fresh detection back to
+ *     whatever the window last saw - which, because level-ups are sparse, could be the
+ *     only detection that will happen for weeks. Dropping them makes main's value win by
+ *     construction.
+ *
+ * Clearing a wrong detection is therefore done by setting an override, which out-ranks
+ * it - see `ActiveCharacter`.
  *
  * PURE and TOTAL: never throws, for any input including `null`, arrays and primitives.
  */
@@ -307,7 +391,7 @@ export function narrowSettingsPatch(raw: unknown): DeepPartial<AppSettings> {
       pollIntervalMs: optionalNumber(field(log, 'pollIntervalMs'))
     },
     character: {
-      name: optionalString(field(character, 'name'))
+      override: optionalString(field(character, 'override'))
     },
     obs: {
       host: optionalString(field(obs, 'host')),
@@ -462,11 +546,64 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   register(IPC_INVOKE.EVENTS_RECENT, () => recentEvents.slice())
   register(IPC_INVOKE.CLIPS_RECENT, () => recentClips.slice())
 
+  register(IPC_INVOKE.CHARACTER_ACTIVE, () => {
+    try {
+      return deps.characters.active()
+    } catch (error) {
+      // `CharacterTracker.active()` is documented as never throwing. If it somehow does,
+      // NOBODY is the honest answer rather than a convenient one: `source: 'none'` is
+      // precisely the state in which `isSelf` is false for every death and the clipper
+      // sits idle, and it is the state the UI shouts about. Reporting anything else here
+      // would paper over a broken detector with a UI that claims clipping is armed.
+      report(error, 'character:active')
+      return NO_CHARACTER
+    }
+  })
+
+  register(IPC_INVOKE.CHARACTER_SUGGESTIONS, async () => {
+    try {
+      // TWO SOURCES, ONE TALLY.
+      //
+      // The session ring buffer alone is empty in EXACTLY the state this picker exists
+      // for. `LogWatcher` starts with a `seekToEnd()`, so a freshly launched app has
+      // parsed none of the log it is tailing: `character.detected` is null on a first
+      // run, the override is empty, the UI raises its full-width alarm - and the picker
+      // it offers alongside it would list nothing, while every name that would fix the
+      // problem sits in the file main already has open. The list would only fill after
+      // the user's first death or level-up, i.e. after the first clip has already been
+      // silently lost, which is the outcome the picker was specified to prevent. The
+      // buffer is also only 200 events deep against a stream dominated by zone traffic,
+      // so it can hold no name-bearing event even mid-session.
+      //
+      // So the tail of Client.txt is swept first (read-only, bounded, and NOT published
+      // onto the bus - see `name-scan.ts`), and the session's events are appended after
+      // it. Order matters: `suggestionsFrom` counts occurrences and breaks ties by
+      // "seen most recently", assuming log order, and the scanned lines are by
+      // definition older than anything the watcher has read since.
+      //
+      // Deaths count here as well as level-ups: the only claim being made is "this name
+      // appears in your log", and a party member costing one wrong row in a picker is
+      // nothing like a party member being silently detected as you.
+      //
+      // EMPTY IS STILL A NORMAL ANSWER (no log path configured yet, a log the game has
+      // never written), which is why the renderer must keep offering free-text entry.
+      const scanned = await scanLogForNameEvents(deps.settings.get().log.path, {
+        onError: (error) => {
+          report(error, 'character:suggestions/scan')
+        }
+      })
+      return { names: CharacterTracker.suggestionsFrom([...scanned, ...recentEvents]) }
+    } catch (error) {
+      report(error, 'character:suggestions')
+      return { names: [] }
+    }
+  })
+
   // -------------------------------------------------------------------------
   // Push channels
   // -------------------------------------------------------------------------
 
-  // These four run inside the emitters they subscribe to, on the critical path.
+  // These five run inside the emitters they subscribe to, on the critical path.
   // Nothing in them may throw: `send` swallows, and the ring-buffer writes cannot
   // fail.
 
@@ -498,12 +635,32 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
     send(IPC_PUSH.CLIP, clip)
   }
 
+  /**
+   * The resolved active character moved - a level-up was detected, or the override was
+   * edited and {@link CharacterPort.refreshOverride} was called.
+   *
+   * NOT ring-buffered, unlike events and clips: `character-changed` carries a COMPLETE
+   * current-value snapshot rather than an occurrence, so a window that opens later gets
+   * the truth from `character:active` instead of from a history it does not need. The
+   * tracker also emits only on a real change, so this cannot spray during a levelling
+   * session.
+   */
+  const onCharacterChanged = (character: ActiveCharacter): void => {
+    if (disposed) return
+    send(IPC_PUSH.CHARACTER, character)
+  }
+
   // Subscribing to `event` (rather than to each of `zone-entered`/`area-generated`/
   // `death`) is what makes this exactly-once: the bus fans every PoeEvent out on
   // `event` IN ADDITION to its per-type channel, so listening to both would show the
   // user every death twice.
+  //
+  // `character-changed` is NOT one of those fanned-out channels - it is derived state
+  // the character tracker owns and `publish` never touches it - so it needs its own
+  // subscription and cannot arrive twice.
   deps.bus.on('event', onBusEvent)
   deps.bus.on('watcher-status', onBusStatus)
+  deps.bus.on('character-changed', onCharacterChanged)
   deps.obs.on('state', onObsState)
   deps.clipper.on('clip', onClipSaved)
 
@@ -527,6 +684,7 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
     try {
       deps.bus.off('event', onBusEvent)
       deps.bus.off('watcher-status', onBusStatus)
+      deps.bus.off('character-changed', onCharacterChanged)
     } catch (error) {
       report(error, 'teardown:bus')
     }
@@ -575,6 +733,39 @@ function reconfigure(
   next: AppSettings,
   report: (error: unknown, context: string) => void
 ): void {
+  // The character tracker learns about level-ups from the bus, but it has no way to hear
+  // about a TYPED override - it reads `settings.character.override` through an injected
+  // getter and only looks when told to. So a settings write that moved any part of
+  // `character` has to poke it.
+  //
+  // Whether `isSelf` is right does NOT depend on this call: `active()` re-reads the
+  // getter every time, and the watcher calls it per line, so the new override is in
+  // force for the very next line either way. What depends on it is the ANNOUNCEMENT -
+  // `character-changed`, and therefore `push:character`, and therefore whether the UI's
+  // "no character detected" warning clears the instant the user fixes it. Skipping it
+  // would leave the window telling the user they are broken while they are not.
+  //
+  // The whole section is compared rather than just `override`, so a hand-edited
+  // settings.json reloaded through this path is covered too. The tracker de-duplicates
+  // internally (it compares against the last value it announced), so a comparison that is
+  // too generous costs nothing.
+  const characterChanged =
+    previous.character.override !== next.character.override ||
+    previous.character.detected !== next.character.detected ||
+    previous.character.detectedClass !== next.character.detectedClass ||
+    previous.character.detectedLevel !== next.character.detectedLevel
+
+  if (characterChanged) {
+    try {
+      deps.characters.refreshOverride()
+    } catch (error) {
+      // Documented as never throwing, and it runs synchronously inside this handler, so
+      // an escape would reject `settings:set` and the user would see their save fail for
+      // a reason that has nothing to do with saving.
+      report(error, 'reconfigure:characters')
+    }
+  }
+
   try {
     void Promise.resolve(deps.watcher.reconfigure()).catch((error: unknown) => {
       report(error, 'reconfigure:watcher')

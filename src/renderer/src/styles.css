@@ -547,6 +547,20 @@ body {
   color: #eda6a2;
 }
 
+/*
+ * A notice that carries its own buttons - the "detection just moved to a different
+ * character" warning. `.notice` is normally a single <p>; this variant is a <div> with
+ * paragraphs and a `.row` of actions inside it, so the paragraph margins the reset
+ * removed have to come back locally.
+ */
+.notice--actions p {
+  margin: 0 0 8px;
+}
+
+.notice--actions .row {
+  margin-top: 10px;
+}
+
 .notes {
   margin: 0;
   padding-left: 18px;
@@ -646,6 +660,158 @@ body {
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* --------------------------------------------------------- character (2) */
+
+/*
+ * The resolved active character. Sized to be the first thing read in the section,
+ * because it is the answer to "why am I / am I not getting clips".
+ */
+.character {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 12px 14px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--ok);
+  border-radius: var(--radius-sm);
+}
+
+/* No character resolved: the card itself carries the alarm colour too, so the state
+ * is legible even if the alert below is scrolled out of view. */
+.character--unknown {
+  border-left-color: var(--bad);
+}
+
+.character__label {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.character__identity {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+
+.character__name {
+  font-size: 19px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  word-break: break-word;
+}
+
+.character__meta {
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.character__pending {
+  color: var(--text-faint);
+  font-size: 13px;
+  font-style: italic;
+}
+
+/*
+ * The "nothing will be clipped" alarm. Deliberately heavier than `.notice`: this is not
+ * a hint, it is the difference between the app working and the app silently doing
+ * nothing, and the user has no other way to find out.
+ */
+.alert {
+  padding: 14px 16px;
+  background: var(--bad-bg);
+  border: 1px solid var(--bad);
+  border-left-width: 4px;
+  border-radius: var(--radius-sm);
+}
+
+.alert__title {
+  margin: 0 0 8px;
+  color: var(--bad);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.alert p {
+  margin: 0 0 8px;
+  color: #eda6a2;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.alert p:last-child {
+  margin-bottom: 0;
+}
+
+.alert__picker {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(214, 86, 79, 0.35);
+}
+
+.picker__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+}
+
+.picker__title {
+  color: #eda6a2;
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.picker__list {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 0;
+  padding: 0;
+}
+
+/* A name chip. One click writes it into the override - see chooseName(). */
+.picker__name {
+  padding: 6px 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.picker__name:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.picker__name:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* Scoped under `.alert` to out-specify the `.alert p` block above without `!important`. */
+.alert .picker__note {
+  margin: 10px 0 0;
+  color: #d9b4b1;
+  font-size: 12px;
+}
+
+.button--small {
+  padding: 4px 10px;
+  font-size: 11.5px;
 }
 
 /* -------------------------------------------------------------------- feeds */

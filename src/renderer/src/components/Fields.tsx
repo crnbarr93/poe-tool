@@ -12,7 +12,7 @@
  * WHY THESE FIELDS KEEP THEIR OWN DRAFT STATE
  * -------------------------------------------
  * They are not plain controlled inputs. The value that comes back down is validated:
- * `validateSettings` trims `character.name` and `obs.host`, clamps `pollIntervalMs`
+ * `validateSettings` trims `character.override` and `obs.host`, clamps `pollIntervalMs`
  * into 100..10000, and turns a blank path into `null`. A naively controlled input
  * therefore fights the user - type a space and it vanishes, type `1` on the way to
  * `1000` and it snaps to `100` with the caret thrown to the end.
