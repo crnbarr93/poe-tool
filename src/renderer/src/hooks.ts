@@ -37,7 +37,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { ActiveCharacter, PoeEvent, WatcherStatus } from '../../shared/events'
-import type { ClipRecord, ObsConnectionState, PoeToolApi } from '../../shared/ipc'
+import type { ClipRecord, ObsConnectionState, PoeToolApi, UpdateState } from '../../shared/ipc'
 import type { AppSettings, DeepPartial } from '../../shared/settings'
 import { applySettingsPatch } from '../../shared/settings'
 import {
@@ -380,6 +380,46 @@ export function useObsStatus(api: PoeToolApi): ObsConnectionState | null {
   }, [api])
 
   return status
+}
+
+/**
+ * Live auto-update state. `null` until the first answer arrives.
+ *
+ * NOT A POLL, and asking does not start one. Main runs exactly one check, at launch, and
+ * pushes every state change on `push:update`; this hook only mirrors it. There is no
+ * "check now" in the IPC contract on purpose, so a config window left open overnight
+ * cannot become a poller against GitHub.
+ *
+ * Subscribe-then-fetch with `prev ?? seeded`, like every other live hook here: the
+ * download can finish in the gap between the fetch being issued and resolving, and the
+ * older snapshot must not overwrite the push that beat it.
+ */
+export function useUpdateState(api: PoeToolApi): UpdateState | null {
+  const [state, setState] = useState<UpdateState | null>(null)
+
+  useEffect(() => {
+    let active = true
+
+    const unsubscribe = api.onUpdate((next) => {
+      if (active) setState(next)
+    })
+
+    void api.getUpdateState().then(
+      (seeded) => {
+        if (active) setState((prev) => prev ?? seeded)
+      },
+      (error: unknown) => {
+        console.warn('poe-tool: update:state failed', describeError(error))
+      }
+    )
+
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [api])
+
+  return state
 }
 
 /**

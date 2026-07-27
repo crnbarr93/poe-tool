@@ -147,11 +147,45 @@ body {
 }
 
 .app__footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 24px;
+  align-items: baseline;
+  justify-content: space-between;
   margin-top: 28px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
   color: var(--text-faint);
   font-size: 12px;
+}
+
+.app__footer-note {
+  margin: 0;
+  max-width: 62ch;
+}
+
+/*
+ * The auto-update line. Always in the DOM (it is a `role="status"` live region that must
+ * exist before it has anything to announce), usually EMPTY - `idle` is by far the most
+ * common state and it renders nothing. `min-height: 0` and no padding mean an empty one
+ * occupies nothing and the footer looks untouched.
+ */
+.update {
+  margin: 0;
+  text-align: right;
+}
+
+.update__line--idle {
+  color: var(--text-faint);
+}
+.update__line--info {
+  color: var(--info);
+}
+.update__line--ok {
+  color: var(--ok);
+}
+.update__line--warn {
+  color: var(--warn);
 }
 
 /* Fatal / loading screens */

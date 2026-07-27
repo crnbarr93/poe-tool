@@ -71,7 +71,8 @@ import {
   type IpcPushPayload,
   type ObsConnectionState,
   type ObsTestRequest,
-  type ObsTestResult
+  type ObsTestResult,
+  type UpdateState
 } from '../shared/ipc'
 import type { AppSettings, DeepPartial, ObsSettings } from '../shared/settings'
 import { PORT_MAX, PORT_MIN } from '../shared/settings'
@@ -263,6 +264,22 @@ export interface ClipperPort {
   readonly off: (channel: 'clip', listener: (clip: ClipRecord) => void) => unknown
 }
 
+/**
+ * What this file needs from `src/main/updater.ts`. `AppUpdater` satisfies it as-is -
+ * `state` is a getter and `on`/`off` mirror `TypedEmitter`, exactly like {@link ObsPort}.
+ *
+ * READ-ONLY ON PURPOSE. There is no `checkNow()` here and there must not be: the IPC
+ * contract deliberately gives the renderer no way to trigger a network check, so a
+ * config window left open cannot turn into a poller against GitHub. The one check
+ * poe-tool performs is fired by `src/main/index.ts` at launch.
+ */
+export interface UpdaterPort {
+  /** Current update state. A stored value, not a probe - reading it starts nothing. */
+  readonly state: UpdateState
+  readonly on: (channel: 'state', listener: (state: UpdateState) => void) => unknown
+  readonly off: (channel: 'state', listener: (state: UpdateState) => void) => unknown
+}
+
 /** Everything {@link registerIpcHandlers} needs. Assembled by `src/main/index.ts`. */
 export interface IpcHandlerDeps {
   readonly settings: SettingsPort
@@ -271,6 +288,7 @@ export interface IpcHandlerDeps {
   readonly clipper: ClipperPort
   readonly watcher: WatcherPort
   readonly characters: CharacterPort
+  readonly updater: UpdaterPort
   /**
    * The window to push to, or null/undefined when there is none.
    *
@@ -541,6 +559,10 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
 
   register(IPC_INVOKE.LOG_STATUS, () => deps.watcher.status)
 
+  // Mirrors `obs:status`: a stored value read straight off the port. Reading it does NOT
+  // trigger a check - see `UpdaterPort`.
+  register(IPC_INVOKE.UPDATE_STATE, () => deps.updater.state)
+
   // `slice()` so a renderer-side mutation (or a later push) cannot reach into the
   // live buffer. The events themselves are deeply readonly value objects.
   register(IPC_INVOKE.EVENTS_RECENT, () => recentEvents.slice())
@@ -650,6 +672,24 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
     send(IPC_PUSH.CHARACTER, character)
   }
 
+  /**
+   * The auto-update state moved.
+   *
+   * NOT ring-buffered, for the same reason `push:character` is not: this is a complete
+   * current-value snapshot, not an occurrence, so a window opening later reads the truth
+   * from `update:state` rather than replaying a history it does not need.
+   *
+   * `AppUpdater` only emits on a real change (its reducer returns the previous state by
+   * reference otherwise), so a download cannot spray a push per network chunk through
+   * here. `send` is the same window-guarded sender everything else uses, so a state
+   * change landing while the user is closing the window is a no-op rather than an
+   * `Object has been destroyed` throw.
+   */
+  const onUpdateState = (state: UpdateState): void => {
+    if (disposed) return
+    send(IPC_PUSH.UPDATE, state)
+  }
+
   // Subscribing to `event` (rather than to each of `zone-entered`/`area-generated`/
   // `death`) is what makes this exactly-once: the bus fans every PoeEvent out on
   // `event` IN ADDITION to its per-type channel, so listening to both would show the
@@ -663,6 +703,7 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   deps.bus.on('character-changed', onCharacterChanged)
   deps.obs.on('state', onObsState)
   deps.clipper.on('clip', onClipSaved)
+  deps.updater.on('state', onUpdateState)
 
   // -------------------------------------------------------------------------
   // Teardown
@@ -699,6 +740,12 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
       deps.clipper.off('clip', onClipSaved)
     } catch (error) {
       report(error, 'teardown:clipper')
+    }
+
+    try {
+      deps.updater.off('state', onUpdateState)
+    } catch (error) {
+      report(error, 'teardown:updater')
     }
 
     recentEvents.length = 0

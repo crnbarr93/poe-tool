@@ -138,12 +138,14 @@ const api: PoeToolApi = {
   getRecentClips: () => invoke(IPC_INVOKE.CLIPS_RECENT),
   getActiveCharacter: () => invoke(IPC_INVOKE.CHARACTER_ACTIVE),
   getCharacterSuggestions: () => invoke(IPC_INVOKE.CHARACTER_SUGGESTIONS),
+  getUpdateState: () => invoke(IPC_INVOKE.UPDATE_STATE),
 
   onEvent: (listener) => subscribe(IPC_PUSH.EVENT, listener),
   onStatus: (listener) => subscribe(IPC_PUSH.STATUS, listener),
   onObsStatus: (listener) => subscribe(IPC_PUSH.OBS_STATUS, listener),
   onClip: (listener) => subscribe(IPC_PUSH.CLIP, listener),
-  onCharacter: (listener) => subscribe(IPC_PUSH.CHARACTER, listener)
+  onCharacter: (listener) => subscribe(IPC_PUSH.CHARACTER, listener),
+  onUpdate: (listener) => subscribe(IPC_PUSH.UPDATE, listener)
 }
 
 // Not wrapped in a try/catch: `exposeInMainWorld` only throws when

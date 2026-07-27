@@ -1,0 +1,223 @@
+# RELEASE - BUILD AND PUBLISH THE WINDOWS INSTALLER
+# =================================================
+# Produces the NSIS per-user .exe installer described in electron-builder.yml and,
+# for tagged builds, publishes it to GitHub Releases so electron-updater can find
+# it. The repo is public, which is what lets the shipped binary read those release
+# assets with no token baked into it.
+#
+#
+# WHICH TRIGGER PRODUCES WHAT
+# ---------------------------
+#   push of a tag matching 'v*'  -> builds, then PUBLISHES to a GitHub Release.
+#                                   Assets: the .exe, its .blockmap, and latest.yml
+#                                   (the file electron-updater actually polls).
+#                                   No workflow artifact is uploaded.
+#
+#   workflow_dispatch (manual)   -> builds, PUBLISHES NOTHING, and uploads the
+#                                   installer as a workflow artifact you can
+#                                   download from the run summary page.
+#                                   No tag, no release, no git side effects.
+#
+# The manual path exists so the whole pipeline can be exercised and the installer
+# smoke-tested on a real Windows box BEFORE the first tag is ever cut. Both paths
+# run the identical `electron-builder --win` packaging command and differ only in
+# the --publish flag, so a green manual run is real evidence about the tagged run.
+#
+#
+# THE VERSION / TAG CONTRACT  <-- READ THIS BEFORE TAGGING
+# -------------------------------------------------------
+# electron-builder takes the version from "version" in package.json. It does NOT
+# read it from the git tag. The tag is only what triggers this workflow.
+#
+#   package.json "version": "0.2.0"   <->   git tag v0.2.0
+#
+# So the release procedure is: bump package.json FIRST, commit it, and only then
+# tag that commit.
+#
+# THE "Verify tag matches package.json version" STEP BELOW ENFORCES THAT, and it
+# is not decoration. Without it a mismatch does something worse than mislabel an
+# asset: electron-publish computes the release tag from package.json too
+# (`this.tag = githubTagPrefix(info) + version`, then `createRelease` posts
+# `tag_name: this.tag`). So tagging v0.2.0 with package.json still at 0.1.0 does
+# not attach anything to v0.2.0 - it creates a SEPARATE draft release tagged
+# v0.1.0 holding "poe-tool Setup 0.1.0.exe" and a latest.yml advertising 0.1.0.
+# The tag that was actually pushed ends up with no release at all, and publishing
+# that draft later makes GitHub materialise a second v0.1.0 tag pointing at the
+# default branch's HEAD. The run stays green throughout. Failing fast before a
+# single byte is uploaded is much cheaper than unpicking that afterwards.
+#
+# The guard also rejects a version that is not plain `major.minor.patch`, because
+# nothing else in the pipeline will. electron-builder only checks that "version"
+# is non-empty (`checkNotEmpty("version", ...)`) and its appInfo explicitly allows
+# missing parts - "Minor and patch can be left out and default to zero" - so
+# `"version": "0.2"` packages and ships perfectly happily, and then throws
+# ERR_UPDATER_INVALID_VERSION inside electron-updater on the USER'S machine,
+# where `semver.parse("0.2")` returns null. `src/main/updater.ts` survives that
+# (see RULE 2 there), but the shipped build would have no working auto-update at
+# all, so it must never leave CI.
+#
+#
+# WHY `permissions: contents: write` IS MANDATORY
+# ----------------------------------------------
+# electron-builder creates the GitHub Release and uploads assets using the token
+# in GH_TOKEN, which here is the automatic GITHUB_TOKEN. Since 2023 that token is
+# read-only by default in many org/repo configurations. Without the block below,
+# the build succeeds, packaging succeeds, and then publishing fails at the very
+# last step with an opaque 403 / "Resource not accessible by integration". That is
+# the classic failure of this workflow - do not remove the permissions block.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual trigger: lets the pipeline be tested without cutting a tag.
+  workflow_dispatch:
+
+# REQUIRED for electron-builder to create the Release with GITHUB_TOKEN. See the
+# header. `contents: write` also covers reading the repo, so no separate read.
+permissions:
+  contents: write
+
+# Intentionally NO `concurrency: cancel-in-progress` here (unlike ci.yml).
+# Interrupting a publish mid-upload can leave a GitHub Release with a partial or
+# missing asset set, which is worse than letting a superseded run finish.
+
+jobs:
+  release:
+    name: Build Windows installer
+    # A NATIVE Windows runner. Do not switch this to ubuntu/macos with a
+    # cross-build: producing an NSIS installer elsewhere needs Wine, is a
+    # perpetual source of subtle breakage, and cannot exercise the real
+    # Windows toolchain. This runner is also the only place in CI that proves
+    # the app packages at all.
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      # THE VERSION GATE. Runs before `npm ci` on purpose: it needs nothing but node
+      # and the checked-out package.json, and a mismatch should cost seconds rather
+      # than a full install-typecheck-test-package cycle.
+      #
+      # `github.event_name` and the ref arrive through `env` rather than being
+      # interpolated into the script body, so the shell never parses anything that
+      # looks like an expression. GITHUB_REF_NAME is the tag name (e.g. "v0.2.0") on
+      # the tag path and the branch name on a manual dispatch - which is why the
+      # comparison is guarded by the event name and the format check is not.
+      - name: Verify tag matches package.json version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          pkg="$(node -p "require('./package.json').version")"
+
+          # Plain major.minor.patch only. A prerelease tag would opt clients into a
+          # channel nobody chose, and a two-part "0.2" is accepted by electron-builder
+          # but fatal to electron-updater at runtime. See the header.
+          if ! printf '%s' "$pkg" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::package.json version \"$pkg\" is not a plain major.minor.patch version. electron-builder will package it anyway and auto-update will fail on the user's machine."
+            exit 1
+          fi
+
+          if [ "$EVENT_NAME" != 'push' ]; then
+            echo "Manual dispatch: package.json version $pkg (no tag to compare against)."
+            exit 0
+          fi
+
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg. Publishing would create a release tagged v$pkg and leave $GITHUB_REF_NAME with no release at all. Bump package.json, commit, delete the tag and re-tag."
+            exit 1
+          fi
+
+          echo "Tag $GITHUB_REF_NAME matches package.json version $pkg."
+
+      - name: Install dependencies
+        run: npm ci
+
+      # QUALITY GATES BEFORE PACKAGING
+      # ------------------------------
+      # These run first and on the same runner so a broken build can never be
+      # published. If either fails the job stops here: no installer is produced,
+      # no release is created, and nothing is uploaded. Note that a tag pointing
+      # at a red commit therefore produces NO release at all rather than a bad
+      # one - fix the commit, delete the tag, and re-tag.
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      # Bundles main / preload / renderer into `out/`, which is the only source
+      # directory electron-builder is configured to package.
+      #
+      # This calls the project's own `build` script rather than invoking
+      # electron-vite directly, so CI and a developer's local build stay in step
+      # if that script ever changes. `build` re-runs typecheck internally; that
+      # duplication is deliberate and costs a few seconds, and keeping the
+      # dedicated Typecheck step above means a type error is reported on its own
+      # clearly-labelled step instead of being buried in build output.
+      - name: Build application bundles
+        run: npm run build
+
+      # ---- TAG PUSH: package AND publish -------------------------------------
+      # `--publish always` is used instead of the fuzzier `onTag` so the
+      # behaviour is decided by this explicit `if`, not by electron-builder
+      # sniffing CI environment variables.
+      #
+      # HEADS UP - THE RELEASE IS CREATED AS A DRAFT.
+      # electron-builder's GitHub publisher defaults to releaseType "draft", and
+      # electron-builder.yml does not override it. A draft release is NOT visible
+      # to unauthenticated clients, so electron-updater will NOT see the new
+      # version until a human opens the release on GitHub and clicks "Publish
+      # release". That manual gate is a reasonable safety check, but it is a
+      # required step - if updates appear to be broken after tagging, confirm the
+      # release was actually published and is not still sitting in drafts.
+      # To make publishing fully automatic instead, set `releaseType: release`
+      # under `publish:` in electron-builder.yml.
+      - name: Package and publish installer to GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: npx electron-builder --win --publish always
+        env:
+          # electron-builder reads GH_TOKEN (not GITHUB_TOKEN) for the github
+          # publish provider. Paired with `permissions: contents: write` above.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---- MANUAL DISPATCH: package only, publish nothing ---------------------
+      - name: Package installer without publishing
+        if: github.event_name == 'workflow_dispatch'
+        run: npx electron-builder --win --publish never
+
+      # Uploaded only on the manual path, so a tagged run does not duplicate
+      # assets that already live on the Release.
+      #
+      # The paths are globbed file-by-file ON PURPOSE. `directories.output` is
+      # `release/`, which also contains win-unpacked/ - the entire expanded app,
+      # hundreds of megabytes of Electron runtime. Uploading the directory
+      # wholesale would be enormous and slow for no benefit. What is wanted is
+      # the installer, its delta-update blockmap, and latest.yml (electron-builder
+      # emits latest.yml even under `--publish never`, so it can be inspected here
+      # to sanity-check the version string before any real tag is cut).
+      - name: Upload installer as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: poe-tool-windows-installer
+          path: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+          # Fail loudly if packaging silently produced nothing, instead of
+          # handing back a green run with an empty artifact.
+          if-no-files-found: error
+          retention-days: 14

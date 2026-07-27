@@ -45,7 +45,8 @@ export const IPC_INVOKE = {
   EVENTS_RECENT: 'events:recent',
   CLIPS_RECENT: 'clips:recent',
   CHARACTER_ACTIVE: 'character:active',
-  CHARACTER_SUGGESTIONS: 'character:suggestions'
+  CHARACTER_SUGGESTIONS: 'character:suggestions',
+  UPDATE_STATE: 'update:state'
 } as const
 
 /**
@@ -60,13 +61,14 @@ export const IPC_PUSH = {
   STATUS: 'push:status',
   OBS_STATUS: 'push:obs-status',
   CLIP: 'push:clip',
-  CHARACTER: 'push:character'
+  CHARACTER: 'push:character',
+  UPDATE: 'push:update'
 } as const
 
-/** Union of the ten invoke channel names. */
+/** Union of the eleven invoke channel names. */
 export type IpcInvokeChannel = (typeof IPC_INVOKE)[keyof typeof IPC_INVOKE]
 
-/** Union of the five push channel names. */
+/** Union of the six push channel names. */
 export type IpcPushChannel = (typeof IPC_PUSH)[keyof typeof IPC_PUSH]
 
 // ---------------------------------------------------------------------------
@@ -239,6 +241,107 @@ export interface ClipRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Auto-update
+// ---------------------------------------------------------------------------
+
+/**
+ * Auto-update is switched OFF because this is not a packaged build.
+ *
+ * A TERMINAL state, not a transient one: `src/main/updater.ts` decides it once from
+ * `app.isPackaged` and never attaches a single electron-updater listener afterwards, so
+ * nothing can move it. The renderer can therefore treat it as "there is nothing to show
+ * here, ever" rather than as "not checked yet".
+ *
+ * In a shipped installer this value is unreachable. It exists so that a developer
+ * running `electron-vite dev` sees WHY the update line is silent instead of assuming it
+ * is broken.
+ */
+export interface UpdateDisabledState {
+  readonly state: 'disabled-in-dev'
+}
+
+/** Nothing to report: no check has run yet, or the last one found no newer version. */
+export interface UpdateIdleState {
+  readonly state: 'idle'
+}
+
+/** A check is in flight against GitHub Releases. */
+export interface UpdateCheckingState {
+  readonly state: 'checking'
+}
+
+/** A newer release exists. The download starts on its own (`autoDownload`). */
+export interface UpdateAvailableState {
+  readonly state: 'available'
+  /** Version string from the release manifest, e.g. `"0.2.0"`. `""` when unreadable. */
+  readonly version: string
+}
+
+/** The installer is downloading in the background. */
+export interface UpdateDownloadingState {
+  readonly state: 'downloading'
+  /**
+   * The version being fetched, or null when the `update-available` event that would
+   * have carried it was never seen (a resumed download, a listener attached late).
+   */
+  readonly version: string | null
+  /**
+   * Whole percent, ALREADY clamped to 0-100 and rounded by `src/main/update-state.ts`.
+   * The renderer renders it directly and must not re-clamp or re-round.
+   *
+   * Rounding happens in main on purpose: `download-progress` fires far more often than
+   * once per percent, and collapsing to integers is what stops this channel from
+   * spraying a push per network chunk.
+   */
+  readonly percent: number
+}
+
+/**
+ * The installer is on disk and will be applied WHEN THE USER QUITS.
+ *
+ * poe-tool never restarts itself to apply an update. A forced restart mid-session could
+ * land in the middle of a replay-buffer save and lose the clip the app exists to
+ * capture, so `autoInstallOnAppQuit` is the only install path - see `src/main/updater.ts`.
+ */
+export interface UpdateReadyState {
+  readonly state: 'ready'
+  /** Version that will be installed on quit. `""` when the manifest was unreadable. */
+  readonly version: string
+}
+
+/**
+ * The check or the download failed.
+ *
+ * EXPECTED AND UNIMPORTANT. Offline, GitHub down, rate limited, a proxy in the way -
+ * all of them land here, and none of them affect the app's actual job. The UI says so
+ * quietly and says nothing else; there is no retry button and no modal.
+ */
+export interface UpdateErrorState {
+  readonly state: 'error'
+  /** Human-readable, already truncated. Safe to render verbatim. */
+  readonly message: string
+}
+
+/**
+ * Everything the updater can report. Switch on `state`, matching the discriminant
+ * convention used by {@link ObsConnectionState} and `WatcherStatus`.
+ *
+ * DELIBERATELY CARRIES NO `since` TIMESTAMP, unlike its two siblings. Those describe a
+ * connection whose age is meaningful ("connecting for 40s" is a problem). This one
+ * describes a background errand nobody is waiting on, and a per-emit timestamp would
+ * make every value structurally new - defeating the change-detection in
+ * `reduceUpdateState` that keeps `download-progress` from flooding `push:update`.
+ */
+export type UpdateState =
+  | UpdateDisabledState
+  | UpdateIdleState
+  | UpdateCheckingState
+  | UpdateAvailableState
+  | UpdateDownloadingState
+  | UpdateReadyState
+  | UpdateErrorState
+
+// ---------------------------------------------------------------------------
 // Invoke contract
 // ---------------------------------------------------------------------------
 
@@ -283,6 +386,11 @@ export interface IpcInvokeContract {
     readonly args: readonly []
     readonly result: CharacterSuggestionsResult
   }
+  /**
+   * Current auto-update state. A stored value in main, not a probe - asking does NOT
+   * trigger a check. The only check poe-tool ever runs happens once at launch.
+   */
+  'update:state': { readonly args: readonly []; readonly result: UpdateState }
 }
 
 /** Argument tuple for a given invoke channel. */
@@ -310,6 +418,12 @@ export interface IpcPushContract {
    * `character-changed`), so the renderer replaces its state rather than patching it.
    */
   'push:character': ActiveCharacter
+  /**
+   * The auto-update state changed. Sent ONLY on a real change - `reduceUpdateState`
+   * returns the previous value by reference when nothing moved, and main skips the send
+   * in that case, which is what keeps a download from pushing once per network chunk.
+   */
+  'push:update': UpdateState
 }
 
 /** Payload type for a given push channel. */
@@ -354,6 +468,8 @@ export interface PoeToolApi {
   readonly getActiveCharacter: () => Promise<ActiveCharacter>
   /** Character names harvested from the log, for the "nothing detected" picker. */
   readonly getCharacterSuggestions: () => Promise<CharacterSuggestionsResult>
+  /** Current auto-update state. Reading it never triggers a check. */
+  readonly getUpdateState: () => Promise<UpdateState>
 
   /** Subscribe to live parsed events. Returns an unsubscribe function. */
   readonly onEvent: (listener: (event: PoeEvent) => void) => Unsubscribe
@@ -365,6 +481,8 @@ export interface PoeToolApi {
   readonly onClip: (listener: (clip: ClipRecord) => void) => Unsubscribe
   /** Subscribe to active-character changes. Returns an unsubscribe function. */
   readonly onCharacter: (listener: (character: ActiveCharacter) => void) => Unsubscribe
+  /** Subscribe to auto-update state changes. Returns an unsubscribe function. */
+  readonly onUpdate: (listener: (state: UpdateState) => void) => Unsubscribe
 }
 
 /** The `window` property name the preload bridge writes {@link PoeToolApi} to. */

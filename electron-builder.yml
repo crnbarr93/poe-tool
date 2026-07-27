@@ -1,0 +1,118 @@
+# ELECTRON-BUILDER PACKAGING CONFIG
+# =================================
+# Produces a Windows NSIS .exe installer from the electron-vite output in `out/`.
+#
+# WHY PER-USER INSTALL (AND WHY IT TAKES THREE KEYS, NOT ONE)
+# -----------------------------------------------------------
+# The project has a standing no-elevation constraint: poe-tool only ever READS
+# Client.txt and talks to OBS over websocket. It never needs admin rights at
+# runtime, so it must never ask for them at install time either. A per-machine
+# install writes to Program Files and therefore triggers a UAC elevation prompt;
+# a per-user install writes to %LOCALAPPDATA%\Programs\poe-tool and runs with the
+# user's normal token - no UAC, no admin, no elevated child processes.
+#
+# This also keeps auto-update honest: electron-updater overwrites the installed
+# app in place, and it can only do that without a second UAC prompt when the
+# install directory is user-writable. An install that lands in Program Files
+# breaks silent updates as well as the no-elevation rule.
+#
+# `perMachine: false` ON ITS OWN DOES NOT DELIVER THAT, and this is the trap
+# worth spelling out. Read app-builder-lib's own docs for the key: "If `oneClick`
+# is `false` and `perMachine` is `false` (default): install mode installer page."
+# That is exactly the combination used here, so NsisTarget defines
+# INSTALL_MODE_PER_ALL_USERS_REQUIRED (`!oneClick`), multiUserUi.nsh draws the
+# two radio buttons - "Anyone who uses this computer (all users)" and "Only for
+# me" - and `perMachine: false` decides only which one is PRESELECTED. The user
+# can still pick the other one, and because `allowElevation` defaults to true the
+# page's leave handler answers that click with UAC_RunElevated. `perMachine` is
+# a default, not a constraint.
+#
+# So the guarantee is made by three keys together, and all three are load-bearing:
+#
+#   perMachine: false                       - per-user is the preselected mode
+#   allowElevation: false                   - the all-users radio is DISABLED for a
+#                                             normal user and relabelled "(must run
+#                                             as admin)", so an unelevated run has
+#                                             no path to a UAC prompt at all
+#   allowToChangeInstallationDirectory: false - the directory page is not shown, so
+#                                             the target cannot be retyped as
+#                                             C:\Program Files\... instead
+#
+# Changing any one of them reintroduces a route to an elevated, non-user-writable
+# install and silently breaks background updates. Do not change them.
+#
+# WHY THE INSTALLER IS UNSIGNED (AND WHAT THAT LOOKS LIKE)
+# -------------------------------------------------------
+# There is no code-signing certificate for this project, so the installer ships
+# unsigned. On first download Windows SmartScreen will show
+# "Windows protected your PC" and require "More info" -> "Run anyway". That is
+# EXPECTED for an unsigned per-user installer and is not a build misconfiguration.
+# The warning fades as the binary accumulates reputation, or disappears entirely
+# if an EV/OV signing certificate is added later (`win.certificateFile` etc.).
+#
+# ICON
+# ----
+# Deliberately no `icon` key anywhere: the app ships with the stock Electron icon
+# by design. Adding an icon file is a separate decision, not an oversight.
+
+appId: com.crnbarr93.poetool
+productName: poe-tool
+
+directories:
+  output: release
+
+# Only the electron-vite build output and the manifest are packaged. Production
+# `dependencies` (electron-updater, obs-websocket-js) are copied automatically by
+# electron-builder from node_modules and do NOT need to be listed here;
+# devDependencies are never copied. The `!` entries below are redundant given the
+# allowlist above them, but they are kept as an explicit, greppable statement that
+# sources, tests, build configs and build outputs must never reach a shipped app.
+files:
+  - out/**
+  - package.json
+  - '!src{,/**/*}'
+  - '!test{,/**/*}'
+  - '!electron.vite.config.*'
+  - '!tsconfig*.json'
+  - '!vitest.config.*'
+  - '!.github{,/**/*}'
+  - '!dist-tools{,/**/*}'
+  - '!release{,/**/*}'
+
+# x64 ONLY. PoE itself ships an x64 client, and Windows-on-ARM runs x64 binaries
+# through emulation, so a single x64 installer covers every machine that can run the
+# game. There is nothing to gain from a second arm64 artifact.
+#
+# WHY `--x64` IS ALSO PASSED ON THE COMMAND LINE (see package.json)
+# ----------------------------------------------------------------
+# The `arch` list below belongs to the `nsis` TARGET ENTRY, not to `win` as a whole.
+# `electron-builder --win --dir` does not build the nsis target - it substitutes the
+# `dir` target - so it never reads this list and falls back to the HOST architecture.
+# On an Apple-silicon dev machine that silently produced `release/win-arm64-unpacked`:
+# a Windows-on-ARM build of an app that only ever ships x64. It looked like a
+# successful smoke test while packaging something nobody will ever install.
+# `package:dir` and `package:win` therefore both pass `--x64` explicitly, so the
+# local smoke test packages the same architecture the release does. Keeping the list
+# here as well means the arch survives even if someone invokes electron-builder
+# directly with no flags.
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false # real installer UI with a wizard, not a silent one-click drop
+  perMachine: false # per-user is the PRESELECTED mode - not a constraint on its own
+  allowElevation: false # ...this is what removes the UAC route entirely (see header)
+  allowToChangeInstallationDirectory: false # ...and this stops a retyped Program Files path
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: poe-tool
+
+# Feeds electron-updater from GitHub Releases. The repo is public, so the shipped
+# binary needs no token to read release assets.
+publish:
+  provider: github
+  owner: crnbarr93
+  repo: poe-tool

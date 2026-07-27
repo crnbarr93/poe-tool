@@ -39,7 +39,8 @@ import type {
   IpcInvokeChannel,
   ObsConnectionState,
   ObsTestRequest,
-  ObsTestResult
+  ObsTestResult,
+  UpdateState
 } from '../src/shared/ipc'
 import type { AppSettings, DeepPartial } from '../src/shared/settings'
 import { applySettingsPatch, DEFAULT_SETTINGS } from '../src/shared/settings'
@@ -220,6 +221,13 @@ function makeHarness(initial: DeepPartial<AppSettings> = {}): Harness {
     watcher: {
       status: { state: 'idle', path: null, since: T0 } satisfies WatcherStatus,
       reconfigure: () => undefined
+    },
+    // Auto-update is not this file's subject; a stub in the state a dev build reports is
+    // enough to satisfy the port. `test/update-state.test.ts` covers the state machine.
+    updater: {
+      state: { state: 'disabled-in-dev' } satisfies UpdateState,
+      on: () => undefined,
+      off: () => undefined
     },
     getWindow: () => window,
     onError: () => undefined
