@@ -19,7 +19,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import type { CurrentZone } from '../src/shared/events'
+import type { CurrentZone, DeathCause } from '../src/shared/events'
 import {
   ClipLibrary,
   DEFAULT_RETRY_DELAYS_MS,
@@ -118,6 +118,7 @@ function moveOptions(sourcePath: string): {
   when: Date
   zone: CurrentZone
   characterName: string
+  cause: DeathCause
   isRemoteObs: boolean
   writeSidecar: boolean
 } {
@@ -126,6 +127,9 @@ function moveOptions(sourcePath: string): {
     when: WHEN,
     zone: KARUI_SHORES,
     characterName: 'FyascoWorbinTime',
+    // What the replay clipper always sends: a `'suicide'` is dropped at admission and
+    // never reaches a move.
+    cause: 'slain',
     isRemoteObs: false,
     writeSidecar: false
   }
@@ -165,6 +169,7 @@ describe('ClipLibrary.moveClip - successful move', () => {
     expect(record.areaId).toBe('2_11_endgame_town')
     expect(record.areaLevel).toBe(69)
     expect(record.characterName).toBe('FyascoWorbinTime')
+    expect(record.cause).toBe('slain')
   })
 
   it('falls back to unknown-zone when the zone is not known', async () => {
@@ -475,6 +480,81 @@ describe('ClipLibrary.moveClip - EXDEV cross-volume fallback', () => {
     // ...and no truncated impostor is sitting in the library.
     expect(await readdir(libraryDir)).toEqual([])
     expect(unlinked).toEqual([path.join(libraryDir, EXPECTED_NAME)])
+  })
+
+  it('leaves nothing behind in the library when the size VERIFICATION itself fails', async () => {
+    // REGRESSION: the discard guard only covered `copyStreamed`. A `stat` that failed
+    // AFTER a complete copy - EPERM/EBUSY from antivirus or the Windows indexer
+    // touching the freshly written file, the very condition RETRYABLE_CODES exists for
+    // - threw straight past the cleanup. The record then said `moved: false` /
+    // `finalPath: null` ("your clip is still at the OBS path") while a FULL-SIZE copy
+    // sat in the library under the final clip name: indistinguishable from a real clip
+    // in a directory listing, and it burned the collision namespace so a genuine retry
+    // of the same second/zone landed on `-2`.
+    const sourcePath = await writeSource()
+    const unlinked: string[] = []
+    let sizeCalls = 0
+
+    const fs: ClipLibraryFs = {
+      ...nodeClipLibraryFs,
+      rename: async () => {
+        throw codedError('EXDEV')
+      },
+      // The copy SUCCEEDS - the destination is complete and correct on disk.
+      sizeOf: async () => {
+        sizeCalls++
+        throw codedError('EPERM')
+      },
+      unlink: async (target) => {
+        unlinked.push(target)
+        await nodeClipLibraryFs.unlink(target)
+      }
+    }
+    const library = new ClipLibrary(libraryDir, { fs, sleep: recordSleeps().sleep })
+
+    const record = await library.moveClip(moveOptions(sourcePath))
+
+    expect(record.moved).toBe(false)
+    expect(record.finalPath).toBeNull()
+    expect(record.note).toContain('EPERM')
+
+    // The user's clip is untouched, in full, exactly where the note says it is...
+    expect(await exists(sourcePath)).toBe(true)
+    expect(await readFile(sourcePath, 'utf8')).toBe(CLIP_BYTES)
+    // ...and no full-size impostor is sitting in the library under the clip name.
+    expect(await readdir(libraryDir)).toEqual([])
+    // EPERM is retryable, so the whole relocate is re-run; every attempt must clean up
+    // after itself, not just the last one.
+    expect(sizeCalls).toBe(DEFAULT_RETRY_DELAYS_MS.length + 1)
+    expect(unlinked).toEqual(
+      Array.from({ length: DEFAULT_RETRY_DELAYS_MS.length + 1 }, () =>
+        path.join(libraryDir, EXPECTED_NAME)
+      )
+    )
+  })
+
+  it('discards the copy when a NON-retryable verification failure gives up after one try', async () => {
+    // Same orphan, one attempt: ENOENT is not retryable, so `#withRetry` rethrows
+    // immediately and there is exactly one chance to clean up.
+    const sourcePath = await writeSource()
+    const library = new ClipLibrary(libraryDir, {
+      fs: {
+        ...nodeClipLibraryFs,
+        rename: async () => {
+          throw codedError('EXDEV')
+        },
+        sizeOf: async () => {
+          throw codedError('ENOENT')
+        }
+      },
+      sleep: recordSleeps().sleep
+    })
+
+    const record = await library.moveClip(moveOptions(sourcePath))
+
+    expect(record.moved).toBe(false)
+    expect(await readdir(libraryDir)).toEqual([])
+    expect(await readFile(sourcePath, 'utf8')).toBe(CLIP_BYTES)
   })
 
   it('reports success with a warning when only the source unlink fails', async () => {

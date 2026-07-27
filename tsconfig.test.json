@@ -1,0 +1,24 @@
+// Typechecks test/** against the SAME strict options the main process is built with.
+//
+// WHY THIS FILE EXISTS
+// --------------------
+// `tsconfig.node.json` and `tsconfig.web.json` both `include` only `src/**`, so until
+// this project was added the test suite was never typechecked at all. That is not a
+// theoretical gap: when `character.name` was replaced by `character.override`,
+// `test/settings-store.test.ts` kept reading `.character.name` and the compiler had
+// nothing to say about it. The drift surfaced as eight red tests asserting `undefined`,
+// and three MORE stale writes that stayed green by accidentally routing through the
+// legacy-key migration in `validateSettings` - a silent pass, which is worse.
+//
+// Extending `tsconfig.node.json` rather than editing it keeps the emit-bearing projects
+// and the electron-vite build untouched; this one is `noEmit` and exists purely as a
+// gate. `types: ["node"]` is inherited and suffices because `vitest.config.ts` sets
+// `globals: false`, so every test imports `describe`/`it`/`expect` explicitly.
+{
+  "extends": "./tsconfig.node.json",
+  "compilerOptions": {
+    "composite": false,
+    "noEmit": true
+  },
+  "include": ["src/main/**/*", "src/preload/**/*", "src/shared/**/*", "test/**/*"]
+}

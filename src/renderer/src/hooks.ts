@@ -36,10 +36,17 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 
-import type { PoeEvent, WatcherStatus } from '../../shared/events'
+import type { ActiveCharacter, PoeEvent, WatcherStatus } from '../../shared/events'
 import type { ClipRecord, ObsConnectionState, PoeToolApi } from '../../shared/ipc'
 import type { AppSettings, DeepPartial } from '../../shared/settings'
 import { applySettingsPatch } from '../../shared/settings'
+import {
+  dismissDetectionSwap,
+  INITIAL_DETECTION_SWAP_STATE,
+  reduceDetectionSwap,
+  type DetectionSwap,
+  type DetectionSwapState
+} from './detection-swap'
 import { describeError } from './format'
 
 // ---------------------------------------------------------------------------
@@ -193,6 +200,159 @@ export function useWatcherStatus(api: PoeToolApi): WatcherStatus | null {
   return status
 }
 
+/**
+ * The RESOLVED active character - override > detected > none, as decided by main.
+ * `null` until the first answer arrives.
+ *
+ * NEVER RE-DERIVED HERE. The renderer holds `settings.character` and could compute this
+ * itself; it must not. Main owns the rule, because it is the same rule `DeathEvent.isSelf`
+ * is stamped with, and a second implementation that drifted would let this window claim
+ * clipping is armed while the clipper sits idle. `source` comes along precisely so the UI
+ * can say WHICH rule fired instead of guessing.
+ *
+ * `push:character` fires only when the resolved value actually CHANGES, so this is not a
+ * poll and does not spray during a levelling session. Subscribe-then-fetch as everywhere
+ * else, with `prev ?? seeded` so a push that beat the fetch is not overwritten by the
+ * older snapshot it beat.
+ */
+export function useActiveCharacter(api: PoeToolApi): ActiveCharacter | null {
+  const [character, setCharacter] = useState<ActiveCharacter | null>(null)
+
+  useEffect(() => {
+    let active = true
+
+    const unsubscribe = api.onCharacter((next) => {
+      if (active) setCharacter(next)
+    })
+
+    void api.getActiveCharacter().then(
+      (seeded) => {
+        if (active) setCharacter((prev) => prev ?? seeded)
+      },
+      (error: unknown) => {
+        console.warn('poe-tool: character:active failed', describeError(error))
+      }
+    )
+
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [api])
+
+  return character
+}
+
+/** What {@link useDetectionSwap} returns. */
+export interface DetectionSwapNotice {
+  /** The unacknowledged swap, or `null` when there is nothing to say. */
+  readonly swap: DetectionSwap | null
+  /** Acknowledge it. Changes no settings - see {@link dismissDetectionSwap}. */
+  readonly dismiss: () => void
+}
+
+/**
+ * Watches the resolved character for AUTO-DETECTION MOVING TO A DIFFERENT CHARACTER.
+ *
+ * A level-2 mule's single level-up permanently displaces the level-93 character the
+ * user actually plays, is persisted, and switches clipping off with no error anywhere -
+ * see `./detection-swap.ts` for the verbatim log lines. This is the only thing in the
+ * app that notices.
+ *
+ * All the logic is in the pure reducer; this hook is just the memory. It re-derives
+ * nothing about WHO is active: `character` is main's answer, arriving on
+ * `push:character` through {@link useActiveCharacter}.
+ */
+export function useDetectionSwap(character: ActiveCharacter | null): DetectionSwapNotice {
+  const [state, setState] = useState<DetectionSwapState>(INITIAL_DETECTION_SWAP_STATE)
+
+  useEffect(() => {
+    if (character === null) return
+    setState((prev) => reduceDetectionSwap(prev, character))
+  }, [character])
+
+  const dismiss = useCallback((): void => {
+    setState(dismissDetectionSwap)
+  }, [])
+
+  return { swap: state.swap, dismiss }
+}
+
+/** What {@link useCharacterSuggestions} returns. */
+export interface CharacterSuggestions {
+  /** Names harvested from the log, main's order. NEVER re-sorted or de-duplicated here. */
+  readonly names: readonly string[]
+  /** True while a fetch is in flight. */
+  readonly loading: boolean
+  /** True once a fetch has completed, so "no names" can be told apart from "not asked yet". */
+  readonly loaded: boolean
+  /** Message from a failed fetch. */
+  readonly error: string | null
+  /** Ask again - main re-reads the log and the session grows, so the answer improves. */
+  readonly refresh: () => void
+}
+
+/**
+ * Character names main has seen in the log, for the picker shown when nothing is known.
+ *
+ * FETCHED ON DEMAND, NOT LIVE. There is no push channel for this and there should not be:
+ * it is a one-shot list the user consults at the moment they are fixing a broken
+ * configuration, not state the window has to mirror. `enabled` gates the request so the
+ * overwhelmingly common case - a character is already known - costs no IPC at all.
+ *
+ * {@link CharacterSuggestions.refresh} matters more than it looks. Main answers from a
+ * bounded sweep of the END of Client.txt merged with this session's events, so the
+ * answer genuinely improves while the window is open - a character whose only recent
+ * appearance is a death that happens a minute from now is not in the first answer.
+ *
+ * An empty result is NORMAL, not an error, and the caller must still offer free-text
+ * entry: there may be no log path configured yet, or the game may never have written
+ * one on this machine.
+ */
+export function useCharacterSuggestions(api: PoeToolApi, enabled: boolean): CharacterSuggestions {
+  const [names, setNames] = useState<readonly string[]>([])
+  const [loading, setLoading] = useState(false)
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [token, setToken] = useState(0)
+
+  useEffect(() => {
+    if (!enabled) return undefined
+
+    let active = true
+    setLoading(true)
+
+    void api.getCharacterSuggestions().then(
+      (result) => {
+        if (!active) return
+        setNames(result.names)
+        setLoading(false)
+        setLoaded(true)
+        setError(null)
+      },
+      (fetchError: unknown) => {
+        if (!active) return
+        setLoading(false)
+        setLoaded(true)
+        setError(describeError(fetchError))
+      }
+    )
+
+    // `active` is what makes a StrictMode double-mount (or a `refresh` that lands while an
+    // earlier request is still in flight) harmless: the stale response is dropped instead
+    // of racing the fresh one into state.
+    return () => {
+      active = false
+    }
+  }, [api, enabled, token])
+
+  const refresh = useCallback((): void => {
+    setToken((current) => current + 1)
+  }, [])
+
+  return { names, loading, loaded, error, refresh }
+}
+
 /** Live OBS connection state. `null` until the first state arrives. */
 export function useObsStatus(api: PoeToolApi): ObsConnectionState | null {
   const [status, setStatus] = useState<ObsConnectionState | null>(null)
@@ -302,13 +462,24 @@ export function useClipFeed(api: PoeToolApi, limit: number): readonly FeedItem<C
  */
 export const SETTINGS_DEBOUNCE_MS = 350
 
-/** Field-by-field equality. `AppSettings` is a fixed, flat, primitive-only shape. */
+/**
+ * Field-by-field equality. `AppSettings` is a fixed, flat, primitive-only shape.
+ *
+ * The three `detected*` fields are compared even though this window can never write them
+ * (main strips them from every patch - see `narrowSettingsPatch`). They are exactly the
+ * fields that change BEHIND the renderer's back, when a level-up lands in main, and this
+ * comparison is what decides whether the reply to a save is adopted into local state.
+ * Leaving them out would pin a stale detection in the UI until the next reload.
+ */
 function sameSettings(a: AppSettings | null, b: AppSettings): boolean {
   if (a === null) return false
   return (
     a.log.path === b.log.path &&
     a.log.pollIntervalMs === b.log.pollIntervalMs &&
-    a.character.name === b.character.name &&
+    a.character.override === b.character.override &&
+    a.character.detected === b.character.detected &&
+    a.character.detectedClass === b.character.detectedClass &&
+    a.character.detectedLevel === b.character.detectedLevel &&
     a.obs.host === b.obs.host &&
     a.obs.port === b.obs.port &&
     a.obs.password === b.obs.password &&

@@ -25,11 +25,42 @@
  *   4. detect + strip `": "`  - the system-marker gate
  *   5. try event patterns     - system-gated ones first, then the DEBUG one
  *   6. fall through           - UnmatchedLine WITH meta
+ *
+ *
+ * WHY THE PATTERNS ARE TRIED IN THE ORDER THEY ARE
+ * ------------------------------------------------
+ * CORRECTNESS DOES NOT DEPEND ON IT. Every body pattern in patterns.ts is
+ * anchored `^...$` and the five sentence shapes are mutually exclusive - the
+ * three that end in `.` have different fixed wording, and `LEVEL_UP` ends on a
+ * digit so it cannot collide with any of them. No reordering can change which
+ * pattern matches a given line; nothing here is shadowing anything.
+ *
+ * So the order is pure cost, and it is picked as "latency-critical first, then
+ * descending frequency in the 375,087-line reference log":
+ *
+ *   1. DEATH        348 hits - FIRST regardless of frequency. This is the one
+ *                   with a deadline: it triggers an OBS replay-buffer save, and
+ *                   every microsecond here is a microsecond further from the
+ *                   moment the player actually died.
+ *   2. ZONE_ENTERED 8,065 hits - by far the most common system-gated line, so
+ *                   the common match exits after two tests.
+ *   3. LEVEL_UP     585 hits.
+ *   4. SUICIDE      7 hits - the rarest thing in the log by two orders of
+ *                   magnitude. It is last DESPITE being a death because it is
+ *                   the one death that is explicitly never clipped (see
+ *                   `DeathCause`), so unlike DEATH it has no deadline at all.
+ *   5. AREA_GENERATED 8,070 hits - cannot move: it is the only ungated pattern
+ *                   and lives outside the `isSystemMessage` block entirely.
+ *
+ * The overwhelmingly common case is a line that matches NOTHING and pays for
+ * every test regardless; the ordering only decides how fast the hits get out.
  */
 
 import type {
   AreaGeneratedEvent,
+  DeathCause,
   DeathEvent,
+  LevelUpEvent,
   LogLineMeta,
   ParseResult,
   ZoneEnteredEvent
@@ -38,6 +69,8 @@ import {
   AREA_GENERATED,
   DEATH,
   ENVELOPE,
+  LEVEL_UP,
+  SUICIDE,
   SYSTEM_MARKER,
   TRAILING_CR,
   ZONE_ENTERED
@@ -63,10 +96,17 @@ export interface ParseLineOptions {
    */
   readonly backlog: boolean
   /**
-   * The local player's character name, used only to compute
-   * `DeathEvent.isSelf`. `""` means UNCONFIGURED, which forces `isSelf` to
-   * false - we refuse to guess, because guessing wrong means clipping a party
-   * member's deaths.
+   * The RESOLVED active character name - `ActiveCharacter.name` from
+   * src/shared/events.ts, i.e. the manual override if one is set, else the
+   * auto-detected name, else nothing. Resolving it is the caller's job; this
+   * function takes a single string and does not know the priority rules.
+   *
+   * Used only to compute `DeathEvent.isSelf`, for both causes. `""` means
+   * UNCONFIGURED AND NEVER DETECTED, which forces `isSelf` to false - we refuse
+   * to guess, because guessing wrong means clipping a party member's deaths.
+   * Note the consequence: with `""` the clipper never fires at all, silently,
+   * which is precisely why "nothing detected yet" has to be surfaced as a
+   * warning in the UI rather than left to be noticed as a missing clip.
    */
   readonly selfName: string
 }
@@ -152,22 +192,16 @@ export function parseLine(raw: string, opts: ParseLineOptions): ParseResult {
   }
 
   // 5a. System-gated patterns. Everything in this block is unreachable for
-  //     player chat, which is the entire anti-spoofing design.
+  //     player chat, which is the entire anti-spoofing design. See the header
+  //     for why they are tried in this order (cost only - they cannot shadow
+  //     one another).
   if (isSystemMessage) {
     const death = DEATH.exec(body)
     if (death !== null) {
       // Group 2 is the speculative " by <killer>" clause; `DeathEvent` is a
       // frozen contract with nowhere to put it, so it is intentionally dropped.
       const [, characterName = ''] = death
-      const event: DeathEvent = {
-        type: 'death',
-        meta,
-        detectedAt: opts.detectedAt,
-        backlog: opts.backlog,
-        characterName,
-        isSelf: matchesSelf(characterName, opts.selfName)
-      }
-      return event
+      return buildDeath(characterName, 'slain', meta, opts)
     }
 
     const zone = ZONE_ENTERED.exec(body)
@@ -181,6 +215,32 @@ export function parseLine(raw: string, opts: ParseLineOptions): ParseResult {
         zoneName
       }
       return event
+    }
+
+    const levelUp = LEVEL_UP.exec(body)
+    if (levelUp !== null) {
+      const [, characterName = '', className = '', level = ''] = levelUp
+      const event: LevelUpEvent = {
+        type: 'level-up',
+        meta,
+        detectedAt: opts.detectedAt,
+        backlog: opts.backlog,
+        characterName,
+        className,
+        // `LEVEL_UP` captures `\d+`, so this is always a finite non-negative
+        // integer - no NaN branch is reachable and none is invented here.
+        level: Number(level)
+      }
+      return event
+    }
+
+    // `/kill`. A real death that must never be clipped: same event, different
+    // `cause`. NOT given an `isSelf` rule of its own - a suicide is ours or a
+    // party member's by exactly the same test as any other death.
+    const suicide = SUICIDE.exec(body)
+    if (suicide !== null) {
+      const [, characterName = ''] = suicide
+      return buildDeath(characterName, 'suicide', meta, opts)
     }
   }
 
@@ -206,6 +266,34 @@ export function parseLine(raw: string, opts: ParseLineOptions): ParseResult {
   //    lands here; `meta` is present so tail:debug can show the decoded
   //    envelope while hunting for a new pattern.
   return { type: 'unmatched', meta, raw: line }
+}
+
+/**
+ * Builds a {@link DeathEvent} from a matched name plus the cause that matched it.
+ *
+ * Exists so the `'slain'` and `'suicide'` branches CANNOT DRIFT. They are tried
+ * three checks apart (see the ordering note in the header), and the difference
+ * between them must stay exactly one field - the discriminator. Constructing the
+ * object twice inline would make it possible to add a field to the death shape,
+ * update the branch you were looking at, and ship a suicide that is silently
+ * missing it. In particular `isSelf` is computed here, once, so a suicide can
+ * never accidentally get a laxer or stricter self-test than a slaying.
+ */
+function buildDeath(
+  characterName: string,
+  cause: DeathCause,
+  meta: LogLineMeta,
+  opts: ParseLineOptions
+): DeathEvent {
+  return {
+    type: 'death',
+    meta,
+    detectedAt: opts.detectedAt,
+    backlog: opts.backlog,
+    characterName,
+    cause,
+    isSelf: matchesSelf(characterName, opts.selfName)
+  }
 }
 
 /**

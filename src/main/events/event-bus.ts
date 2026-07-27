@@ -31,6 +31,18 @@
  *    has to know the character-name setting exists;
  *  - an unrecognised line -> `unmatched` and nowhere else.
  *
+ * TWO THINGS THIS RULE DELIBERATELY DOES NOT DO, both of them about the same
+ * `DeathEvent` field:
+ *  - it does not filter SUICIDES off `death` or `death:self`. PoE's `/kill` is a real
+ *    death and it counts; it just must never become a clip. The clipper filters on
+ *    `cause` itself (see `DeathCause`), because the bus's job is to report what
+ *    happened, not to decide what is interesting - and the event feed, the death
+ *    count and any future stats all want the suicide.
+ *  - it does not give `level-up` a `:self` variant. A level-up is the evidence that
+ *    ESTABLISHES who "self" is, so filtering it on the current answer would make
+ *    detection unable to bootstrap: with nothing detected yet, nothing would pass,
+ *    so nothing would ever be detected.
+ *
  *
  * A THROWING LISTENER MUST NOT KILL THE TAIL LOOP
  * -----------------------------------------------
@@ -93,6 +105,14 @@ export class PoeEventBus extends TypedEmitter<PoeEventMap> {
    * Fans one parse result out across the bus per the `PoeEventMap` contract.
    *
    * NEVER THROWS. Every emission is individually contained - see the file header.
+   * That contract is what lets `LogWatcher` call this straight from a `setInterval`
+   * callback, and nothing added to this switch may weaken it: every arm must go
+   * through {@link safeEmit}, never through the inherited `emit`.
+   *
+   * The switch has no `default`. A new `PoeEvent` variant therefore compiles here
+   * and is published on `event` but not on its own channel - which is the failure
+   * this method's test file exists to catch, since TypeScript cannot: `PoeEventMap`
+   * is a hand-written map and nothing structurally ties it to the event union.
    */
   publish(result: ParseResult): void {
     if (result.type === 'unmatched') {
@@ -104,6 +124,8 @@ export class PoeEventBus extends TypedEmitter<PoeEventMap> {
 
     switch (result.type) {
       case 'death':
+        // Suicides included, on BOTH channels: `death:self` is filtered by WHOSE
+        // death it is, never by whether the death is worth watching.
         this.safeEmit('death', result)
         if (result.isSelf) this.safeEmit('death:self', result)
         break
@@ -112,6 +134,13 @@ export class PoeEventBus extends TypedEmitter<PoeEventMap> {
         break
       case 'area-generated':
         this.safeEmit('area-generated', result)
+        break
+      case 'level-up':
+        // Everyone's level-ups, ours included and unfiltered - see the file header.
+        // The character tracker does NOT listen here; `LogWatcher` hands it level-ups
+        // directly so that detection cannot be starved by a throwing listener and is
+        // current before the next line is parsed.
+        this.safeEmit('level-up', result)
         break
     }
   }

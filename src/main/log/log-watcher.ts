@@ -84,9 +84,35 @@
  * {@link replay} is the deliberate exception, and it is for the `tail:debug` CLI
  * only: it reads from offset 0 with `backlog: true` so side-effecting consumers
  * (the replay clipper above all) skip every event it produces.
+ *
+ *
+ * WHO IS "ME" IS RESOLVED PER LINE, NOT PER TICK
+ * ----------------------------------------------
+ * `parseLine` needs the resolved active character name to compute
+ * `DeathEvent.isSelf`, and the ONLY evidence of who that is arrives IN THE LOG, on
+ * a level-up line (see `LevelUpEvent`). So the answer can change halfway through a
+ * batch of lines, and this class asks {@link CharacterSource} for it immediately
+ * before each `parseLine` call rather than sampling it once per tick.
+ *
+ * That is what makes a level-up encountered mid-stream take effect for the deaths
+ * that FOLLOW it, and it is correct BY CONSTRUCTION rather than by luck: lines are
+ * decoded in file order and handed over strictly one at a time, synchronously, so
+ * ingesting line N's level-up before line N+1 is parsed is the only possible
+ * interleaving. There is no window in which a later line could be parsed against an
+ * earlier answer, and equally no way for a level-up to retroactively change a line
+ * that was already parsed - a death logged BEFORE the first level-up stays
+ * `isSelf: false`, which is exactly right, because at that instant we genuinely did
+ * not know.
  */
 
-import type { ParseResult, PoeEventMap, WatcherState, WatcherStatus } from '../../shared/events'
+import type {
+  ActiveCharacter,
+  LevelUpEvent,
+  ParseResult,
+  PoeEventMap,
+  WatcherState,
+  WatcherStatus
+} from '../../shared/events'
 import { DEFAULT_SETTINGS, type AppSettings } from '../../shared/settings'
 import { LogReader, type LogReadResult, type LogReadStatus } from './log-reader'
 import { parseLine } from './parse-line'
@@ -127,6 +153,46 @@ export interface LogReaderLike {
   seekToStart(): void
 }
 
+/**
+ * The slice of the character tracker the watcher drives.
+ *
+ * TWO HALVES OF ONE LOOP, which is why they are one interface rather than two
+ * options: the watcher READS the current answer to stamp `isSelf` onto a line, and
+ * WRITES back the level-up lines that change that answer. Splitting them would let
+ * a caller wire up one direction and silently get a detector that never learns, or
+ * a learner nobody ever asks.
+ *
+ * DELIBERATELY STRUCTURAL, in the same style as {@link WatcherBus} and
+ * `ZoneTrackerBus`: `src/main/log/character-tracker.ts` satisfies this as-is with no
+ * adapter, and a test can satisfy it with a six-line stub instead of standing up a
+ * settings store.
+ *
+ * THE RESOLUTION RULE IS NOT HERE. Which name wins - manual override, else
+ * auto-detected, else none - belongs to the tracker (see `ActiveCharacter`), and
+ * this file must never re-derive it. The watcher takes whatever `active.name` says
+ * and does not interpret it.
+ */
+export interface CharacterSource {
+  /**
+   * The resolved active character RIGHT NOW. `name` is null when nothing is
+   * configured and nothing has ever been detected, which forces every
+   * `DeathEvent.isSelf` to false - see {@link LogWatcher} for why that is a refusal
+   * rather than a fallback.
+   *
+   * Read once per LINE, so it must be cheap and must never throw.
+   */
+  readonly active: ActiveCharacter
+  /**
+   * Ingests a level-up so that the lines AFTER it resolve against the character it
+   * names. Called before the event is published, and called for backlog lines too -
+   * see {@link LogWatcher}.
+   *
+   * Must never throw; the watcher contains it anyway, because a detector that
+   * failed must not be able to stop the tail.
+   */
+  handleLevelUp(event: LevelUpEvent): void
+}
+
 /** Everything {@link LogWatcher} needs. All of it explicit; none of it global. */
 export interface LogWatcherOptions {
   /** Where parsed events and status changes go. */
@@ -134,15 +200,29 @@ export interface LogWatcherOptions {
   /**
    * Reads the CURRENT settings. Called at the top of every tick rather than
    * captured once, which is what makes live reconfiguration work: the watcher
-   * notices a changed `log.path` / `log.pollIntervalMs` on its own and restarts,
-   * and picks up a changed `character.name` on the very next line with no
-   * restart at all.
+   * notices a changed `log.path` / `log.pollIntervalMs` on its own and restarts.
+   *
+   * NOT where the character name comes from - that is {@link characters}, which
+   * resolves `settings.character` itself and is consulted per LINE rather than per
+   * tick.
    *
    * Must not throw. If it does, the last good snapshot is reused and the error is
    * reported - the tail loop is not allowed to die because settings were briefly
    * unreadable.
    */
   readonly getSettings: () => AppSettings
+  /**
+   * Who counts as "me", and where level-ups go so that answer can change.
+   *
+   * OPTIONAL, BUT THE APP MUST ALWAYS SUPPLY ONE. Omitting it does not fall back to
+   * reading `settings.character` here - there is exactly one implementation of the
+   * override-then-detected priority rule and it is not in this file. With no source
+   * the watcher has no answer, so every `DeathEvent.isSelf` is false and the replay
+   * clipper stays idle for the whole session. That is the safe direction to fail
+   * (never a clip of a party member's death) but it IS a silent one, which is why
+   * `src/main/index.ts` wires this unconditionally.
+   */
+  readonly characters?: CharacterSource
   /**
    * Overrides how a {@link ParseResult} reaches the bus.
    *
@@ -203,8 +283,24 @@ export interface ReplayResult {
  *  - a death additionally goes to `death:self` when `isSelf`, so the replay
  *    clipper never has to know the character-name setting exists;
  *  - unrecognised lines go to `unmatched` and nowhere else.
- *  - `zone-changed` is NOT emitted here. That is derived state and belongs to
- *    `zone-tracker.ts`, which subscribes to this bus.
+ *  - `zone-changed` and `character-changed` are NOT emitted here. Those are derived
+ *    state and belong to `zone-tracker.ts` and `character-tracker.ts`.
+ *
+ * THE CHARACTER TRACKER IS FED DIRECTLY, IN ADDITION TO ITS OWN BUS SUBSCRIPTION.
+ * `character-tracker.ts` subscribes to `level-up` the way `zone-tracker.ts`
+ * subscribes to `zone-entered`, and that subscription is the right thing for every
+ * OTHER producer on the bus. It is not enough for this one, for two reasons:
+ *  - ORDERING. The tracker has to be current before the NEXT line is parsed. Via the
+ *    bus that would depend on fan-out order, and on
+ *    {@link LogWatcherOptions.publish} reaching the bus at all - which it need not,
+ *    since the publish override may send results anywhere.
+ *  - CONTAINMENT. `TypedEmitter.emit` stops dispatching a channel once a listener
+ *    throws, so one broken `level-up` listener registered ahead of the tracker would
+ *    silently stop detection - i.e. stop all clipping - for the rest of the session.
+ * Feeding it here makes the update a step in the pipeline rather than an observation
+ * of it. Driving both paths for the same line is a deliberate no-op: `handleLevelUp`
+ * is idempotent (it re-persists nothing and re-announces nothing when the detection
+ * has not moved), which is what makes the belt and the braces safe to wear together.
  */
 export class LogWatcher {
   readonly #bus: WatcherBus
@@ -212,6 +308,9 @@ export class LogWatcher {
   readonly #createReader: (path: string) => LogReaderLike
   readonly #onError: (error: unknown) => void
   readonly #publish: (result: ParseResult) => void
+
+  /** Null when no source was injected; then `isSelf` is false for every line. */
+  readonly #characters: CharacterSource | null
 
   /** Null whenever no path is configured, and between {@link stop} and {@link start}. */
   #reader: LogReaderLike | null = null
@@ -261,6 +360,7 @@ export class LogWatcher {
     this.#createReader = options.createReader ?? ((path) => new LogReader(path))
     this.#onError = options.onError ?? (() => undefined)
     this.#publish = options.publish ?? ((result) => this.#fanOut(result))
+    this.#characters = options.characters ?? null
     this.#status = { state: 'idle', path: null, since: Date.now() }
   }
 
@@ -322,7 +422,8 @@ export class LogWatcher {
    * Safe (and intended) to call unconditionally from the `settings:set` handler:
    * it compares first and does nothing when the change was unrelated, so editing
    * the OBS password does not tear down a healthy tail. Changing the character
-   * name needs no restart at all - it is read fresh on every tick.
+   * override needs no restart at all: the watcher does not hold that value, it asks
+   * {@link LogWatcherOptions.characters} for the resolved answer line by line.
    *
    * A no-op while stopped.
    */
@@ -346,6 +447,13 @@ export class LogWatcher {
    *
    * Drains in `LogReader`-sized chunks until a read consumes nothing, so a file
    * far larger than memory is streamed rather than slurped.
+   *
+   * FEEDS THE CHARACTER TRACKER exactly like the live tail does, which is the whole
+   * point of routing the debug CLI through here: replaying a real Client.txt has to
+   * arrive at the same active character - and therefore the same `isSelf` on the
+   * same deaths - that the app would have arrived at while tailing it live. A replay
+   * that resolved the character differently from production would be a debugging
+   * tool that lies about the thing it exists to verify.
    */
   async replay(path: string): Promise<ReplayResult> {
     const reader = this.#createReader(path)
@@ -353,7 +461,6 @@ export class LogWatcher {
     // pooled reader cannot silently start mid-file.
     reader.seekToStart()
 
-    const selfName = this.#readSettings().character.name
     let linesRead = 0
     let eventsPublished = 0
 
@@ -367,9 +474,10 @@ export class LogWatcher {
         const detectedAt = Date.now()
         for (const line of result.lines) {
           linesRead++
-          const parsed = parseLine(line, { detectedAt, backlog: true, selfName })
+          // Resolved per line, and the tracker updated before the next one - see
+          // #parseAndDeliver and the file header.
+          const parsed = this.#parseAndDeliver(line, detectedAt, true)
           if (parsed.type !== 'unmatched') eventsPublished++
-          this.#deliver(parsed)
         }
       }
 
@@ -412,7 +520,7 @@ export class LogWatcher {
       const seek = await reader.seekToEnd()
       if (this.#stale(generation)) return
       this.#reader = reader
-      this.#handleReadResult(reader, seek, 0, settings.character.name)
+      this.#handleReadResult(reader, seek, 0)
     }
 
     if (this.#stale(generation)) return
@@ -484,7 +592,7 @@ export class LogWatcher {
     const result = await reader.readDelta()
     if (this.#stale(generation)) return // Stopped or restarted mid-read; drop it.
 
-    this.#handleReadResult(reader, result, previousOffset, settings.character.name)
+    this.#handleReadResult(reader, result, previousOffset)
   }
 
   /** True when `log.path` or `log.pollIntervalMs` differ from what is applied. */
@@ -501,12 +609,7 @@ export class LogWatcher {
    * is why it takes the reader rather than reading `this.#reader`: during startup
    * the reader is not installed yet.
    */
-  #handleReadResult(
-    reader: LogReaderLike,
-    result: LogReadResult,
-    previousOffset: number,
-    selfName: string
-  ): void {
+  #handleReadResult(reader: LogReaderLike, result: LogReadResult, previousOffset: number): void {
     const path = reader.path
 
     if (result.status === 'file-missing') {
@@ -551,6 +654,10 @@ export class LogWatcher {
     if (result.lines.length > 0) {
       // One timestamp for the whole batch: they were all read at the same instant,
       // and a per-line `Date.now()` would imply a precision we do not have.
+      //
+      // The CHARACTER NAME is the opposite case and is resolved per line inside
+      // #parseAndDeliver: it is derived from the lines themselves, so a level-up in
+      // the middle of this batch has to take effect for the rest of it.
       const detectedAt = Date.now()
       for (const line of result.lines) {
         // `result.backlog`, NOT `result.rotated`. `rotated` is a one-shot status
@@ -560,7 +667,7 @@ export class LogWatcher {
         // chunk of a rotation - and every byte of a file that appeared after being
         // missing - as LIVE, which is precisely what fires clips for hours-old
         // deaths. See `LogReader`'s header.
-        this.#deliver(parseLine(line, { detectedAt, backlog: result.backlog, selfName }))
+        this.#parseAndDeliver(line, detectedAt, result.backlog)
       }
       this.#linesRead += result.lines.length
       this.#lastLineAt = detectedAt
@@ -579,6 +686,76 @@ export class LogWatcher {
   // -------------------------------------------------------------------------
   // Publishing
   // -------------------------------------------------------------------------
+
+  /**
+   * THE PER-LINE PIPELINE, and the only place a line becomes an event: resolve who
+   * "me" is, parse, teach the tracker, publish. In that order, synchronously, one
+   * line at a time.
+   *
+   * Shared by the live tick and by {@link replay} so the two cannot drift - the
+   * whole value of `tail:debug` rests on it resolving characters identically to
+   * production.
+   *
+   * WHY THE ORDER IS WHAT IT IS:
+   *  1. RESOLVE FIRST, because `isSelf` must describe what was known when this line
+   *     was logged. A level-up on this very line is evidence about the lines AFTER
+   *     it, never about itself.
+   *  2. INGEST BEFORE PUBLISHING, so that anything reacting to the `level-up` event
+   *     (the renderer feed, a future consumer) already sees the new answer, and so
+   *     the tracker is current no matter what a listener does.
+   *  3. PUBLISH LAST, contained.
+   *
+   * Backlog lines teach the tracker too. `backlog` means "this existed before we
+   * attached", which suppresses SIDE EFFECTS (clips); learning who the player is, is
+   * a pure state update, exactly like the zone tracker's. Refusing to learn from it
+   * would mean a rotation drain, or a log that appeared after being missing, could
+   * contain the only level-up we will see for weeks and we would throw it away.
+   *
+   * @returns the parse result, so callers can count events without re-parsing.
+   */
+  #parseAndDeliver(line: string, detectedAt: number, backlog: boolean): ParseResult {
+    const result = parseLine(line, { detectedAt, backlog, selfName: this.#activeName() })
+    if (result.type === 'level-up') this.#learn(result)
+    this.#deliver(result)
+    return result
+  }
+
+  /**
+   * The resolved active character name for the line about to be parsed, or `""`.
+   *
+   * `""` is `parseLine`'s documented "unconfigured" value and forces `isSelf` false.
+   * BOTH paths to it are legitimate and neither is an error: no source was injected,
+   * or the source resolved `source: 'none'` because the user has set no override and
+   * nothing has ever been detected. A NULL ACTIVE CHARACTER IS NOT AN EXCEPTIONAL
+   * CONDITION - it is the state a fresh install starts in, and everything downstream
+   * of it simply does nothing.
+   *
+   * Reading `active` is contained: it is a getter on injected code, so it can throw
+   * in principle, and a throw here would be inside the tail loop.
+   */
+  #activeName(): string {
+    const source = this.#characters
+    if (source === null) return ''
+    try {
+      return source.active.name ?? ''
+    } catch (error) {
+      this.#report(error)
+      return ''
+    }
+  }
+
+  /** Hands a level-up to the character source, absorbing anything it throws. */
+  #learn(event: LevelUpEvent): void {
+    const source = this.#characters
+    if (source === null) return
+    try {
+      source.handleLevelUp(event)
+    } catch (error) {
+      // A detector that failed is a session with stale `isSelf`, which is bad. A
+      // detector that failed AND killed the tail loop is a dead app, which is worse.
+      this.#report(error)
+    }
+  }
 
   /** Hands a parse result to the configured publisher, absorbing anything it throws. */
   #deliver(result: ParseResult): void {
@@ -610,6 +787,12 @@ export class LogWatcher {
         break
       case 'area-generated':
         this.#safeEmit('area-generated', result)
+        break
+      case 'level-up':
+        // No `level-up:self` counterpart, deliberately: a level-up is what
+        // ESTABLISHES who "self" is, so pre-filtering it on the current answer would
+        // make detection unable to bootstrap. See `PoeEventMap`.
+        this.#safeEmit('level-up', result)
         break
     }
   }

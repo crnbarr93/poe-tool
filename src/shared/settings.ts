@@ -36,16 +36,55 @@ export interface LogSettings {
   readonly pollIntervalMs: number
 }
 
-/** Which character counts as "me". */
+/**
+ * Which character counts as "me".
+ *
+ * TWO HALVES, ONE ANSWER. `override` is what the user typed; `detected*` is what the
+ * app learned from `... (Marauder) is now level 42` lines. They are stored separately
+ * rather than collapsed into one field so that clearing a manual override falls back
+ * to the detection instead of wiping it, and so the UI can always show both. The
+ * resolved answer - `override` when non-empty, else `detected`, else nothing - is
+ * `ActiveCharacter` in `./events`; NOTHING should re-derive that rule by hand.
+ */
 export interface CharacterSettings {
   /**
-   * The local player's character name, used to compute `DeathEvent.isSelf`.
+   * MANUAL override of the active character. Wins over {@link detected} whenever it
+   * is non-empty.
    *
-   * `""` (the default) means UNCONFIGURED: `isSelf` is then always false, nothing
-   * is ever published on `death:self`, and the replay clipper stays idle. We refuse
-   * to guess, because a wrong guess means clipping a party member's deaths.
+   * Exists for GROUP PLAY: a party member's level-up lands in our Client.txt exactly
+   * like our own, so auto-detection can honestly pick the wrong person. Typing the
+   * name here settles it.
+   *
+   * `""` (the default) means "no override" - NOT "unconfigured", because detection
+   * may still supply a name. Trimmed by {@link validateSettings}.
    */
-  readonly name: string
+  readonly override: string
+  /**
+   * The character name auto-detected from the most recent qualifying
+   * `LevelUpEvent`, or `null` if none has ever been seen.
+   *
+   * PERSISTED ON PURPOSE, and this is the whole reason it lives in settings rather
+   * than in memory: level-ups are SPARSE. A level-98 character can play for weeks
+   * without producing one, so a detection held only in RAM would be lost on the next
+   * restart and the app would go back to clipping nothing. One level-up ever must be
+   * enough, forever.
+   *
+   * Whitespace-only values normalise to `null`.
+   */
+  readonly detected: string | null
+  /**
+   * Class or ascendancy from that same level-up line, e.g. `"Marauder"`,
+   * `"Berserker"`. `null` when nothing has been detected.
+   *
+   * DISPLAY ONLY. It changes under a fixed name when the character ascends, so it is
+   * not part of anyone's identity - never compare on it.
+   */
+  readonly detectedClass: string | null
+  /**
+   * Level from that same level-up line. `null` when nothing has been detected.
+   * Display only; clamped to {@link CHARACTER_LEVEL_MIN}..{@link CHARACTER_LEVEL_MAX}.
+   */
+  readonly detectedLevel: number | null
 }
 
 /** obs-websocket v5 connection parameters. */
@@ -109,6 +148,10 @@ export const PORT_MAX = 65_535
 export const DEBOUNCE_MS_MIN = 0
 /** One minute. Anything longer is indistinguishable from `clips.enabled = false`. */
 export const DEBOUNCE_MS_MAX = 60_000
+/** A character exists at level 1; there is no level 0. */
+export const CHARACTER_LEVEL_MIN = 1
+/** PoE 1's level cap. `character.detectedLevel` is display-only, so clamping is cosmetic. */
+export const CHARACTER_LEVEL_MAX = 100
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -128,7 +171,10 @@ export const DEFAULT_SETTINGS: AppSettings = Object.freeze({
     pollIntervalMs: 500
   }),
   character: Object.freeze({
-    name: ''
+    override: '',
+    detected: null,
+    detectedClass: null,
+    detectedLevel: null
   }),
   obs: Object.freeze({
     host: '127.0.0.1',
@@ -230,6 +276,52 @@ function coerceNullableString(value: unknown, fallback: string | null): string |
   return fallback
 }
 
+/**
+ * {@link coerceNullableString} plus a trim, for a name that may legitimately be
+ * absent - `character.detected` and `character.detectedClass`.
+ *
+ * The trim is not cosmetic: names are compared case-insensitively AFTER trimming
+ * everywhere else in the app, and a PoE character name contains no whitespace at all,
+ * so a stray space from a hand-edited settings.json would otherwise survive into a
+ * comparison that then silently never matches. A value that is nothing but whitespace
+ * becomes `null` - i.e. "never detected" - rather than `""`.
+ */
+function coerceNameOrNull(value: unknown, fallback: string | null): string | null {
+  const raw = coerceNullableString(value, fallback)
+  if (raw === null) return null
+  const trimmed = raw.trim()
+  return trimmed === '' ? null : trimmed
+}
+
+/**
+ * {@link coerceInt} for a `number | null` field.
+ *
+ * An explicit `null` means "unknown" and is preserved as such. Anything unusable
+ * (absent, `NaN`, an object) falls back, exactly as {@link coerceInt} does; a usable
+ * but out-of-range number is CLAMPED rather than rejected, matching every other
+ * numeric field here. Clamping is safe for the only current caller
+ * (`character.detectedLevel`) because that field is display-only - nothing branches
+ * on it, so a corrupted value costs a wrong number in the UI, not a wrong decision.
+ */
+function coerceIntOrNull(
+  value: unknown,
+  fallback: number | null,
+  min: number,
+  max: number
+): number | null {
+  if (value === null) return null
+  let n: number
+  if (typeof value === 'number') {
+    n = value
+  } else if (typeof value === 'string' && value.trim() !== '') {
+    n = Number(value)
+  } else {
+    return fallback
+  }
+  if (!Number.isFinite(n)) return fallback
+  return clamp(Math.round(n), min, max)
+}
+
 /** Accepts real booleans and the strings `"true"`/`"false"` (JSON hand-edits, HTML inputs). */
 function coerceBoolean(value: unknown, fallback: boolean): boolean {
   if (typeof value === 'boolean') return value
@@ -267,6 +359,20 @@ function coerceInt(value: unknown, fallback: number, min: number, max: number): 
 // ---------------------------------------------------------------------------
 
 /**
+ * The pre-0.2 key for the manually configured character: `character.name: string`.
+ *
+ * Read ONLY by {@link validateSettings}, which migrates a non-empty value into
+ * `character.override`. Named rather than inlined so the migration is greppable, and
+ * kept unexported so nothing else can start depending on the dead key or write it
+ * back out.
+ *
+ * THIS IS THE MIGRATION CONTRACT A TEST SHOULD PIN:
+ * `validateSettings({ character: { name: 'Exile' } }).character.override === 'Exile'`,
+ * and `.character` must not carry a `name` property afterwards.
+ */
+const LEGACY_CHARACTER_NAME_KEY = 'name'
+
+/**
  * Deep-merges arbitrary untrusted input over {@link DEFAULT_SETTINGS} and returns a
  * complete, in-range {@link AppSettings}.
  *
@@ -281,12 +387,36 @@ function coerceInt(value: unknown, fallback: number, min: number, max: number): 
  * It is used for BOTH jobs: sanitising settings.json on load, and applying a
  * {@link DeepPartial} patch (merge the patch onto the current settings first, then
  * pass the merged object through here).
+ *
+ * It is also where the ONE schema migration lives - see {@link LEGACY_CHARACTER_NAME_KEY}.
  */
 export function validateSettings(input: unknown): AppSettings {
   const log = field(input, 'log')
   const character = field(input, 'character')
   const obs = field(input, 'obs')
   const clips = field(input, 'clips')
+
+  // MIGRATION, and it is meant to be visible to a test that reads this file.
+  //
+  // The previous version persisted the manually configured character as
+  // `character.name: string`. That key is gone; `character.override` replaced it. A
+  // user who already typed their name into the old build MUST NOT silently lose it -
+  // losing it means `isSelf` goes false everywhere and death clipping stops working
+  // with no error anywhere, which is the exact failure mode this project is built to
+  // avoid. So a non-empty legacy `name` is carried into `override`.
+  //
+  // Precedence: an explicit non-empty `override` always wins, so a settings.json that
+  // somehow carries both is not dragged backwards by the stale key.
+  //
+  // NOT STICKY: the legacy key is only ever read off the RAW input. Once a validated
+  // AppSettings exists it has no `name` field, so `applySettingsPatch` cannot
+  // resurrect it and a user clearing the override to `""` really does clear it. The
+  // next write of settings.json drops the legacy key for good.
+  const explicitOverride = coerceString(
+    field(character, 'override'),
+    DEFAULT_SETTINGS.character.override
+  ).trim()
+  const legacyName = coerceString(field(character, LEGACY_CHARACTER_NAME_KEY), '').trim()
 
   return {
     log: {
@@ -300,7 +430,19 @@ export function validateSettings(input: unknown): AppSettings {
     },
     character: {
       // Trimmed: a trailing space on a character name would silently break isSelf.
-      name: coerceString(field(character, 'name'), DEFAULT_SETTINGS.character.name).trim()
+      // Falls back to the migrated legacy `name` - see the block above.
+      override: explicitOverride === '' ? legacyName : explicitOverride,
+      detected: coerceNameOrNull(field(character, 'detected'), DEFAULT_SETTINGS.character.detected),
+      detectedClass: coerceNameOrNull(
+        field(character, 'detectedClass'),
+        DEFAULT_SETTINGS.character.detectedClass
+      ),
+      detectedLevel: coerceIntOrNull(
+        field(character, 'detectedLevel'),
+        DEFAULT_SETTINGS.character.detectedLevel,
+        CHARACTER_LEVEL_MIN,
+        CHARACTER_LEVEL_MAX
+      )
     },
     obs: {
       host: coerceString(field(obs, 'host'), DEFAULT_SETTINGS.obs.host).trim(),

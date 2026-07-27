@@ -21,7 +21,7 @@
  * or anything holding a handle to a main-process resource.
  */
 
-import type { PoeEvent, WatcherStatus } from './events'
+import type { ActiveCharacter, DeathCause, PoeEvent, WatcherStatus } from './events'
 import type { AppSettings, DeepPartial } from './settings'
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,9 @@ export const IPC_INVOKE = {
   LOG_AUTODETECT: 'log:autodetect',
   LOG_STATUS: 'log:status',
   EVENTS_RECENT: 'events:recent',
-  CLIPS_RECENT: 'clips:recent'
+  CLIPS_RECENT: 'clips:recent',
+  CHARACTER_ACTIVE: 'character:active',
+  CHARACTER_SUGGESTIONS: 'character:suggestions'
 } as const
 
 /**
@@ -57,13 +59,14 @@ export const IPC_PUSH = {
   EVENT: 'push:event',
   STATUS: 'push:status',
   OBS_STATUS: 'push:obs-status',
-  CLIP: 'push:clip'
+  CLIP: 'push:clip',
+  CHARACTER: 'push:character'
 } as const
 
-/** Union of the eight invoke channel names. */
+/** Union of the ten invoke channel names. */
 export type IpcInvokeChannel = (typeof IPC_INVOKE)[keyof typeof IPC_INVOKE]
 
-/** Union of the four push channel names. */
+/** Union of the five push channel names. */
 export type IpcPushChannel = (typeof IPC_PUSH)[keyof typeof IPC_PUSH]
 
 // ---------------------------------------------------------------------------
@@ -162,6 +165,29 @@ export interface LogAutodetectResult {
 }
 
 // ---------------------------------------------------------------------------
+// Character payloads
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of `character:suggestions`: character names HARVESTED FROM THE LOG, for the
+ * one-click picker the UI must offer when no character is known.
+ *
+ * This exists because `ActiveCharacter` with `source: 'none'` is a dead end for the
+ * user - death clipping quietly does nothing and there is no obvious way to fix it.
+ * Rather than make them type a name from memory, main scans Client.txt for the names
+ * it has seen and offers them.
+ *
+ * Ordering is main's choice (most recent / most frequent first is the useful one) and
+ * the renderer must NOT re-sort or de-duplicate; it presents the list as given.
+ * EMPTY IS A NORMAL ANSWER - a fresh log, or a character that has never levelled -
+ * and the UI still has to offer free-text entry in that case. The renderer never
+ * guesses: picking a suggestion writes `settings.character.override`, explicitly.
+ */
+export interface CharacterSuggestionsResult {
+  readonly names: readonly string[]
+}
+
+// ---------------------------------------------------------------------------
 // Clips
 // ---------------------------------------------------------------------------
 
@@ -189,8 +215,23 @@ export interface ClipRecord {
   readonly areaId: string | null
   /** Area monster level at capture time. Null if unknown. */
   readonly areaLevel: number | null
-  /** Configured character name at capture time. `""` when unconfigured. */
+  /**
+   * The resolved active character at capture time - the override if there was one,
+   * otherwise the detected name. `""` when neither was known.
+   */
   readonly characterName: string
+  /**
+   * Why this clip exists: which kind of death triggered it. Purely informational
+   * here - the UI shows it so a clip is never unexplained.
+   *
+   * In practice every record written by the replay clipper carries `'slain'`, because
+   * a `'suicide'` (PoE's `/kill`) is deliberate and never clipped - see `DeathCause`
+   * in `./events`. The field is still a full {@link DeathCause} rather than a
+   * `'slain'` literal so that a future manual "clip that" button, or a change of mind
+   * about suicides, does not have to break this contract. Consumers must handle both
+   * values, and must not infer "not a suicide" from a clip existing.
+   */
+  readonly cause: DeathCause
   /** True once the file was successfully relocated into the library directory. */
   readonly moved: boolean
   /** Free-form note: a user annotation, or the reason the move failed. */
@@ -228,6 +269,20 @@ export interface IpcInvokeContract {
   'events:recent': { readonly args: readonly []; readonly result: readonly PoeEvent[] }
   /** Newest-first list of recent clips, for populating the UI on mount. */
   'clips:recent': { readonly args: readonly []; readonly result: readonly ClipRecord[] }
+  /**
+   * The RESOLVED active character (override > detected > none), not the raw settings.
+   * Main owns the resolution rule; the renderer must never re-derive it from
+   * `settings.character`.
+   */
+  'character:active': { readonly args: readonly []; readonly result: ActiveCharacter }
+  /**
+   * Character names harvested from the log, for the picker shown when nothing is
+   * known. May be slow (it reads the log) and may legitimately resolve empty.
+   */
+  'character:suggestions': {
+    readonly args: readonly []
+    readonly result: CharacterSuggestionsResult
+  }
 }
 
 /** Argument tuple for a given invoke channel. */
@@ -249,6 +304,12 @@ export interface IpcPushContract {
   'push:status': WatcherStatus
   'push:obs-status': ObsConnectionState
   'push:clip': ClipRecord
+  /**
+   * The resolved active character changed - a level-up was detected, or the override
+   * was edited. Carries the complete new value (mirroring the bus's
+   * `character-changed`), so the renderer replaces its state rather than patching it.
+   */
+  'push:character': ActiveCharacter
 }
 
 /** Payload type for a given push channel. */
@@ -289,6 +350,10 @@ export interface PoeToolApi {
   readonly getRecentEvents: () => Promise<readonly PoeEvent[]>
   /** Recent clips from the clip library, for initial render. */
   readonly getRecentClips: () => Promise<readonly ClipRecord[]>
+  /** The resolved active character (override > detected > none), as decided by main. */
+  readonly getActiveCharacter: () => Promise<ActiveCharacter>
+  /** Character names harvested from the log, for the "nothing detected" picker. */
+  readonly getCharacterSuggestions: () => Promise<CharacterSuggestionsResult>
 
   /** Subscribe to live parsed events. Returns an unsubscribe function. */
   readonly onEvent: (listener: (event: PoeEvent) => void) => Unsubscribe
@@ -298,6 +363,8 @@ export interface PoeToolApi {
   readonly onObsStatus: (listener: (status: ObsConnectionState) => void) => Unsubscribe
   /** Subscribe to newly saved clips. Returns an unsubscribe function. */
   readonly onClip: (listener: (clip: ClipRecord) => void) => Unsubscribe
+  /** Subscribe to active-character changes. Returns an unsubscribe function. */
+  readonly onCharacter: (listener: (character: ActiveCharacter) => void) => Unsubscribe
 }
 
 /** The `window` property name the preload bridge writes {@link PoeToolApi} to. */

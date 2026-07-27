@@ -23,6 +23,7 @@ import type { ParseLineOptions } from '../src/main/log/parse-line'
 import type {
   AreaGeneratedEvent,
   DeathEvent,
+  LevelUpEvent,
   ParseResult,
   UnmatchedLine,
   ZoneEnteredEvent
@@ -35,6 +36,21 @@ import type {
 /** REAL LINE. Own-character death, system message. */
 const LINE_DEATH =
   '2026/07/26 19:26:31 1018412156 cffb0658 [INFO Client 50396] : FyascoWorbinTime has been slain.'
+
+/**
+ * REAL LINE. `/kill`, system message. One of only SEVEN in the 375,087-line
+ * reference log - a rate so low that a regression here would never be spotted
+ * in the wild, which is the whole reason it is pinned in a test.
+ */
+const LINE_SUICIDE =
+  '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] : LargeThumbThomasReturns has committed suicide.'
+
+/**
+ * REAL LINE. Level-up, system message. Note there is NO TRAILING PERIOD - the
+ * sentence ends on the digits, unlike every other body pattern in the project.
+ */
+const LINE_LEVEL_UP =
+  '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : LargeThumbThomasReturns (Marauder) is now level 2'
 
 /** REAL LINE. Zone transition, system message. */
 const LINE_ZONE =
@@ -63,6 +79,11 @@ function parse(raw: string, overrides: Partial<ParseLineOptions> = {}): ParseRes
 
 function expectDeath(result: ParseResult): DeathEvent {
   if (result.type !== 'death') throw new Error(`expected a death event, got "${result.type}"`)
+  return result
+}
+
+function expectLevelUp(result: ParseResult): LevelUpEvent {
+  if (result.type !== 'level-up') throw new Error(`expected level-up, got "${result.type}"`)
   return result
 }
 
@@ -216,6 +237,8 @@ describe('death detection', () => {
     expect(event.type).toBe('death')
     expect(event.characterName).toBe('FyascoWorbinTime')
     expect(event.isSelf).toBe(true)
+    // The game killed us. Contrast LINE_SUICIDE below.
+    expect(event.cause).toBe('slain')
   })
 
   it('marks a party member death as not self', () => {
@@ -258,6 +281,8 @@ describe('death detection', () => {
 
     expect(event.characterName).toBe('FyascoWorbinTime')
     expect(event.isSelf).toBe(true)
+    // Still an ordinary death: the killer clause does not change the cause.
+    expect(event.cause).toBe('slain')
   })
 
   it('refuses a multi-word "name" - PoE names have no spaces', () => {
@@ -271,6 +296,203 @@ describe('death detection', () => {
   it('refuses trailing text after the final period', () => {
     const line =
       '2026/07/26 19:26:31 1018412156 cffb0658 [INFO Client 50396] : FyascoWorbinTime has been slain. gg'
+    expectUnmatched(parse(line))
+  })
+
+  it('still recognises every real slain shape - the 348/348 baseline', () => {
+    // The reference log contains 348 "has been slain." lines and the parser
+    // matched all 348 before suicide/level-up were added. These are the shapes
+    // those 348 take: six distinct own-alt names, all bare (no killer clause).
+    // If adding a pattern ever shadowed DEATH, this is what would break.
+    const names = [
+      'LargeThumbThomasReturns',
+      'WorldWordleChamp',
+      'LargerThumbThomas',
+      'Burgertrash',
+      'OneLongToe',
+      'FyascoWorbinTime'
+    ] as const
+
+    for (const name of names) {
+      const line = `2026/07/26 19:26:31 1018412156 cffb0658 [INFO Client 50396] : ${name} has been slain.`
+      const event = expectDeath(parse(line, { selfName: name }))
+
+      expect(event.characterName).toBe(name)
+      expect(event.cause).toBe('slain')
+      expect(event.isSelf).toBe(true)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Suicide (`/kill`)
+// ---------------------------------------------------------------------------
+
+describe('suicide detection', () => {
+  it('parses the real suicide line as a DeathEvent with cause "suicide"', () => {
+    const event = expectDeath(parse(LINE_SUICIDE, { selfName: 'LargeThumbThomasReturns' }))
+
+    // It IS a death - it counts for stats and rides the same bus channels.
+    expect(event.type).toBe('death')
+    expect(event.characterName).toBe('LargeThumbThomasReturns')
+    expect(event.isSelf).toBe(true)
+    // ...and the discriminator is the ONLY thing that tells the clipper to
+    // ignore it. Getting this wrong means clipping thirty seconds of nothing.
+    expect(event.cause).toBe('suicide')
+  })
+
+  it('decodes the envelope of the real suicide line', () => {
+    const { meta } = expectDeath(parse(LINE_SUICIDE))
+
+    expect(meta.isSystemMessage).toBe(true)
+    expect(meta.body).toBe('LargeThumbThomasReturns has committed suicide.')
+    expect(meta.pid).toBe(42816)
+    expect(meta.clientMs).toBe(176574078)
+  })
+
+  it('applies the same isSelf rule as a slaying', () => {
+    // Case-insensitive + trimmed, exactly like DEATH.
+    expect(expectDeath(parse(LINE_SUICIDE, { selfName: 'largethumbthomasreturns' })).isSelf).toBe(
+      true
+    )
+    expect(
+      expectDeath(parse(LINE_SUICIDE, { selfName: '  LargeThumbThomasReturns  ' })).isSelf
+    ).toBe(true)
+    // A party member's /kill is still reported, just not as ours.
+    expect(expectDeath(parse(LINE_SUICIDE, { selfName: 'SomeoneElse' })).isSelf).toBe(false)
+    // Nothing configured and nothing detected => never self.
+    expect(expectDeath(parse(LINE_SUICIDE, { selfName: '' })).isSelf).toBe(false)
+  })
+
+  it('refuses a multi-word "name" - PoE names have no spaces', () => {
+    const line =
+      '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] : lol Bob has committed suicide.'
+    const result = expectUnmatched(parse(line))
+
+    expect(result.meta?.isSystemMessage).toBe(true)
+  })
+
+  it('refuses trailing text after the final period', () => {
+    const line =
+      '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] : Bob has committed suicide. lol'
+    expectUnmatched(parse(line))
+  })
+
+  it('has no speculative " by <killer>" clause, unlike a slaying', () => {
+    // DEATH tolerates "slain by Hillock." because other clients are reported to
+    // log it. Nothing suggests a suicide variant, so it gets no such slack.
+    const line =
+      '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] : Bob has committed suicide by Hillock.'
+    expectUnmatched(parse(line))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Level up - the sole basis for auto-detecting the active character
+// ---------------------------------------------------------------------------
+
+describe('level-up detection', () => {
+  it('parses the real level-up line', () => {
+    const event = expectLevelUp(parse(LINE_LEVEL_UP))
+
+    expect(event.type).toBe('level-up')
+    expect(event.characterName).toBe('LargeThumbThomasReturns')
+    expect(event.className).toBe('Marauder')
+    expect(event.level).toBe(2)
+    expect(event.meta.isSystemMessage).toBe(true)
+    // No trailing period on this sentence - the body ends on the digit.
+    expect(event.meta.body).toBe('LargeThumbThomasReturns (Marauder) is now level 2')
+  })
+
+  it('emits a number, not a string, for the level', () => {
+    expect(typeof expectLevelUp(parse(LINE_LEVEL_UP)).level).toBe('number')
+  })
+
+  it('parses an ASCENDANCY class, not just a base class', () => {
+    // REAL LINE. The same character that levelled as a Marauder above is a
+    // Berserker after ascending - which is exactly why className is display
+    // metadata and nothing may be keyed on it.
+    const line =
+      '2025/06/19 21:04:27 27066859 cff945b9 [INFO Client 7816] : LargeThumbThomasReturns (Berserker) is now level 41'
+    const event = expectLevelUp(parse(line))
+
+    expect(event.characterName).toBe('LargeThumbThomasReturns')
+    expect(event.className).toBe('Berserker')
+    expect(event.level).toBe(41)
+  })
+
+  it('parses the highest level actually observed in the reference log', () => {
+    // REAL LINE. Level 98, two digits, a different alt and a third class.
+    const line =
+      '2026/03/17 15:10:58 398336625 cffb06dd [INFO Client 46332] : WorldWordleChamp (Slayer) is now level 98'
+    const event = expectLevelUp(parse(line))
+
+    expect(event.characterName).toBe('WorldWordleChamp')
+    expect(event.className).toBe('Slayer')
+    expect(event.level).toBe(98)
+  })
+
+  it('parses a THREE-DIGIT level', () => {
+    // Synthetic: the reference log tops out at 98, but PoE 1 caps at 100 and
+    // `(\d+)` is deliberately unbounded. A pattern that quietly stopped matching
+    // at the cap would lose the level-100 detection - the rarest and most
+    // interesting one there is.
+    const line =
+      '2026/03/17 15:10:58 398336625 cffb06dd [INFO Client 46332] : WorldWordleChamp (Slayer) is now level 100'
+    const event = expectLevelUp(parse(line))
+
+    expect(event.level).toBe(100)
+    expect(event.className).toBe('Slayer')
+  })
+
+  it('keeps an underscore in a character name', () => {
+    // REAL LINE. `\S+` covers the whole token, punctuation included.
+    const line =
+      '2026/07/24 17:53:15 840012609 cffb06dd [INFO Client 44504] : Frogo_ (Witch) is now level 2'
+    const event = expectLevelUp(parse(line))
+
+    expect(event.characterName).toBe('Frogo_')
+    expect(event.className).toBe('Witch')
+  })
+
+  it('tolerates a multi-word class name', () => {
+    // Synthetic. No observed class contains a space, but the pattern uses
+    // `[^)]+` rather than `\S+` so that assumption is not baked in.
+    const line =
+      '2026/03/17 15:10:58 398336625 cffb06dd [INFO Client 46332] : WorldWordleChamp (Some Future Class) is now level 42'
+    expect(expectLevelUp(parse(line)).className).toBe('Some Future Class')
+  })
+
+  it('refuses a trailing period - this sentence genuinely has none', () => {
+    const line =
+      '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : LargeThumbThomasReturns (Marauder) is now level 2.'
+    const result = expectUnmatched(parse(line))
+
+    expect(result.meta?.isSystemMessage).toBe(true)
+  })
+
+  it('refuses a multi-word "name" - PoE names have no spaces', () => {
+    const line =
+      '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : lol Bob (Marauder) is now level 2'
+    expectUnmatched(parse(line))
+  })
+
+  it('refuses a missing or empty class', () => {
+    const stamp = '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : '
+
+    expectUnmatched(parse(`${stamp}Bob is now level 2`))
+    expectUnmatched(parse(`${stamp}Bob () is now level 2`))
+  })
+
+  it('refuses a non-numeric level', () => {
+    const line =
+      '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : Bob (Marauder) is now level two'
+    expectUnmatched(parse(line))
+  })
+
+  it('refuses trailing text after the level', () => {
+    const line =
+      '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] : Bob (Marauder) is now level 2 gz'
     expectUnmatched(parse(line))
   })
 })
@@ -289,6 +511,50 @@ describe('system-marker gate (anti-spoofing)', () => {
     expect(result.meta?.isSystemMessage).toBe(false)
     // The dangerous text IS in the body - only the gate stopped it.
     expect(result.meta?.body).toBe('TrollMcSpoof: FyascoWorbinTime has been slain.')
+  })
+
+  it('does NOT produce a DeathEvent for a chat line containing "has committed suicide."', () => {
+    // "] Troll: ..." - player chat, so the body has no leading ": ".
+    const line =
+      '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] Troll: Bob has committed suicide.'
+    const result = expectUnmatched(parse(line))
+
+    expect(result.meta?.isSystemMessage).toBe(false)
+    // The dangerous text IS in the body - only the gate stopped it.
+    expect(result.meta?.body).toBe('Troll: Bob has committed suicide.')
+  })
+
+  it('does NOT produce a LevelUpEvent for a chat line containing "is now level"', () => {
+    // The worst of the three to get wrong: this one does not fake an event, it
+    // fakes WHO WE ARE. A stranger in global chat could point auto-detection at
+    // a name that is not ours, and every subsequent real death of ours would
+    // then read as someone else's and never clip.
+    const line =
+      '2025/06/19 16:22:33 10127484 cff945b9 [INFO Client 6956] Troll: Bob (Slayer) is now level 99'
+    const result = expectUnmatched(parse(line))
+
+    expect(result.meta?.isSystemMessage).toBe(false)
+    expect(result.meta?.body).toBe('Troll: Bob (Slayer) is now level 99')
+  })
+
+  it('is not fooled by a leading colon typed before either new sentence', () => {
+    // Renders as "] Name: : text" - the body starts with the name, never ": ".
+    const stamp = '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] Troll: : '
+
+    expect(expectUnmatched(parse(`${stamp}Bob has committed suicide.`)).meta?.isSystemMessage).toBe(
+      false
+    )
+    expect(expectUnmatched(parse(`${stamp}Bob (Slayer) is now level 99`)).meta?.isSystemMessage).toBe(
+      false
+    )
+  })
+
+  it('is not fooled by guild or whisper prefixes on either new sentence', () => {
+    // Real chat renders as "] &<Guild> Name: msg" and "] @To Name: msg".
+    const head = '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] '
+
+    expectUnmatched(parse(`${head}&Guild Troll: Bob has committed suicide.`))
+    expectUnmatched(parse(`${head}@To Troll: Bob (Slayer) is now level 99`))
   })
 
   it('does NOT produce a ZoneEnteredEvent for a chat line containing "You have entered"', () => {
@@ -376,10 +642,66 @@ describe('area-generated detection', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Pattern independence
+// ---------------------------------------------------------------------------
+
+describe('no pattern shadows another', () => {
+  // parse-line.ts orders its checks purely for cost (latency-critical DEATH
+  // first, then descending frequency), and that is only defensible because the
+  // five sentence shapes are mutually exclusive. If that ever stopped being
+  // true, the ordering would silently start deciding which event you get.
+  // NOTE both death shapes resolve to the SAME `type` ('death') and differ only
+  // in `cause` - that is the design, not an oversight, so the table carries the
+  // label separately from the discriminant it is checking.
+  const cases: ReadonlyArray<readonly [label: string, line: string, type: string]> = [
+    ['slain', LINE_DEATH, 'death'],
+    ['suicide', LINE_SUICIDE, 'death'],
+    ['level-up', LINE_LEVEL_UP, 'level-up'],
+    ['zone-entered', LINE_ZONE, 'zone-entered'],
+    ['area-generated', LINE_AREA, 'area-generated']
+  ]
+
+  for (const [label, line, type] of cases) {
+    it(`resolves the real ${label} line to exactly "${type}"`, () => {
+      expect(parse(line).type).toBe(type)
+    })
+  }
+
+  it('separates the two death causes by `cause`, not by `type`', () => {
+    expect(expectDeath(parse(LINE_DEATH)).cause).toBe('slain')
+    expect(expectDeath(parse(LINE_SUICIDE)).cause).toBe('suicide')
+  })
+
+  it('does not read a level-up as a death, or a death as a level-up', () => {
+    // The two share a leading `\S+` and are only three checks apart.
+    expect(parse(LINE_LEVEL_UP).type).not.toBe('death')
+    expect(parse(LINE_DEATH).type).not.toBe('level-up')
+    expect(parse(LINE_SUICIDE).type).not.toBe('level-up')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // CRLF
 // ---------------------------------------------------------------------------
 
 describe('CRLF tolerance', () => {
+  it('strips the carriage return before matching a level-up', () => {
+    // Sharpest case in the project: LEVEL_UP ends on `(\d+)$`, so a surviving
+    // `\r` puts a non-digit at the end of the string and the pattern misses.
+    const event = expectLevelUp(parse(`${LINE_LEVEL_UP}\r`))
+
+    expect(event.level).toBe(2)
+    expect(event.characterName).toBe('LargeThumbThomasReturns')
+    expect(event.meta.raw.endsWith('\r')).toBe(false)
+  })
+
+  it('strips the carriage return before matching a suicide', () => {
+    const event = expectDeath(parse(`${LINE_SUICIDE}\r`))
+
+    expect(event.cause).toBe('suicide')
+    expect(event.meta.body).toBe('LargeThumbThomasReturns has committed suicide.')
+  })
+
   it('strips a trailing carriage return before matching', () => {
     const event = expectDeath(parse(`${LINE_DEATH}\r`))
 
@@ -412,6 +734,10 @@ describe('injected options', () => {
 
     expect(expectDeath(parse(LINE_DEATH, opts)).detectedAt).toBe(42)
     expect(expectDeath(parse(LINE_DEATH, opts)).backlog).toBe(true)
+    expect(expectDeath(parse(LINE_SUICIDE, opts)).detectedAt).toBe(42)
+    expect(expectDeath(parse(LINE_SUICIDE, opts)).backlog).toBe(true)
+    expect(expectLevelUp(parse(LINE_LEVEL_UP, opts)).detectedAt).toBe(42)
+    expect(expectLevelUp(parse(LINE_LEVEL_UP, opts)).backlog).toBe(true)
     expect(expectZone(parse(LINE_ZONE, opts)).detectedAt).toBe(42)
     expect(expectZone(parse(LINE_ZONE, opts)).backlog).toBe(true)
     expect(expectArea(parse(LINE_AREA, opts)).detectedAt).toBe(42)
@@ -460,6 +786,7 @@ describe('client-sample.txt fixture', () => {
     expect(deaths).toHaveLength(2)
     expect(deaths.map((d) => d.characterName)).toEqual(['FyascoWorbinTime', 'PartyHealerBot'])
     expect(deaths.map((d) => d.isSelf)).toEqual([true, false])
+    expect(deaths.map((d) => d.cause)).toEqual(['slain', 'slain'])
   })
 
   it('parses the CRLF-terminated party death cleanly', () => {

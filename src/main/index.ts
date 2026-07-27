@@ -25,17 +25,22 @@
  * CONSTRUCTION ORDER IS A REAL DEPENDENCY ORDER, NOT A STYLE CHOICE
  * -----------------------------------------------------------------
  * ```text
- *   SettingsStore ─┬─────────────────────────────► LogWatcher ──► PoeEventBus
- *                  │                                                  │
- *                  │                              ZoneTracker ◄───────┤
- *                  │                                    │             │
- *                  ├──► ClipLibrary ──┐                 │             │
- *                  └──► ObsClient ────┴──► ReplayClipper ◄────────────┘  (death:self)
+ *   SettingsStore ─┬──► CharacterTracker ──────► LogWatcher ──► PoeEventBus
+ *                  │            ▲   (per line)        │              │
+ *                  │            └── level-up ─────────┘              │
+ *                  │                                                 │
+ *                  │                              ZoneTracker ◄──────┤
+ *                  │                                    │            │
+ *                  ├──► ClipLibrary ──┐                 │            │
+ *                  └──► ObsClient ────┴──► ReplayClipper ◄───────────┘  (death:self)
  *                                                │
  *                       registerIpcHandlers ◄────┴── clips + bus + obs + watcher
  * ```
  *  - the bus must exist before the watcher (the watcher publishes onto it) and before
- *    the zone tracker and clipper (they subscribe to it);
+ *    the zone tracker, character tracker and clipper (they subscribe to it);
+ *  - the character tracker must exist before the watcher, which asks it who "me" is
+ *    once per LINE and hands level-ups back in, so that a level-up encountered
+ *    mid-stream changes `isSelf` for the lines after it;
  *  - the zone tracker must exist before the clipper, which snapshots `zones.current`
  *    at death-admission time;
  *  - `registerIpcHandlers` must run BEFORE `watcher.start()`, because it owns the
@@ -75,6 +80,7 @@ import type { WatcherStatus } from '../shared/events'
 import type { ClipRecord } from '../shared/ipc'
 import { PoeEventBus } from './events/event-bus'
 import { registerIpcHandlers } from './ipc-handlers'
+import { CharacterTracker } from './log/character-tracker'
 import { LogWatcher } from './log/log-watcher'
 import { ZoneTracker } from './log/zone-tracker'
 import { ClipLibrary, type MoveClipOptions } from './obs/clip-library'
@@ -136,6 +142,7 @@ interface Services {
   readonly settings: SettingsStore
   readonly bus: PoeEventBus
   readonly zones: ZoneTracker
+  readonly characters: CharacterTracker
   readonly watcher: LogWatcher
   readonly obs: ObsClient
   readonly clipper: ReplayClipper
@@ -214,11 +221,48 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     }
   })
 
-  // 4. The producer. `publish` is delegated to the bus so the live tail and
+  // 4. Who counts as "me". Built BEFORE the watcher because the watcher consumes it
+  //    per line, and it reads/writes settings through four narrow callbacks rather
+  //    than being handed the store - so it cannot be the thing that decides what else
+  //    lives in settings.json.
+  //
+  //    `persist` is what makes a single level-up survive a restart, which is the
+  //    entire point: level-ups are sparse enough that a level-98 character can play
+  //    for weeks without producing one. `save` throws on a failed write; the tracker
+  //    contains that and keeps the detection for the session.
+  const characters = new CharacterTracker({
+    bus,
+    getOverride: () => settings.get().character.override,
+    getPersisted: () => {
+      const { detected, detectedClass, detectedLevel } = settings.get().character
+      return { name: detected, className: detectedClass, level: detectedLevel }
+    },
+    persist: (detection) => {
+      settings.save({
+        character: {
+          detected: detection.name,
+          detectedClass: detection.className,
+          detectedLevel: detection.level
+        }
+      })
+    },
+    onError: (error) => {
+      log('character-tracker', error)
+    }
+  })
+
+  // 5. The producer. `publish` is delegated to the bus so the live tail and
   //    `replay()` share one fan-out implementation - see the bus's header.
+  //
+  //    `characters` is NOT optional in practice: without it the watcher has no way to
+  //    resolve who "me" is, so every `DeathEvent.isSelf` would be false and the
+  //    clipper would sit idle for the whole session without a single error anywhere.
+  //    It is passed as `.characterSource` - the two-way view - because the watcher
+  //    both reads the resolved name per line and hands level-ups back in.
   const watcher = new LogWatcher({
     bus,
     getSettings: () => settings.get(),
+    characters: characters.characterSource,
     publish: (result) => {
       bus.publish(result)
     },
@@ -227,14 +271,14 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     }
   })
 
-  // 5. OBS. Not connected yet; `start()` decides that from `obs.autoConnect`.
+  // 6. OBS. Not connected yet; `start()` decides that from `obs.autoConnect`.
   const obs = new ObsClient({
     onInternalError: (error, context) => {
       log(`obs/${context}`, error)
     }
   })
 
-  // 6. The clip pipeline. The clipper subscribes to `death:self` in its constructor,
+  // 7. The clip pipeline. The clipper subscribes to `death:self` in its constructor,
   //    which is why the bus and the zone tracker have to exist by now.
   const clipper = new ReplayClipper({
     bus,
@@ -253,7 +297,7 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     if (isClipFailure(outcome)) log(`clip/${outcome.kind}`, outcome.message)
   })
 
-  // 7. IPC last, and BEFORE the watcher starts - it owns the `events:recent` ring
+  // 8. IPC last, and BEFORE the watcher starts - it owns the `events:recent` ring
   //    buffer, and anything published before it subscribes is invisible to a window
   //    that opens later in the session.
   const disposeIpc = registerIpcHandlers({
@@ -261,6 +305,11 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     bus,
     obs,
     clipper,
+    // `CharacterTracker` satisfies `CharacterPort` as-is: `active()` and
+    // `refreshOverride()` are both methods, and the port asks for exactly those two.
+    // Passed by reference rather than adapted, so the IPC layer calls them as members
+    // and the class's `#` private state resolves - see the port's own note on that.
+    characters,
     // `LogWatcher.status` is a getter and `reconfigure()` matches the port exactly, but
     // `WatcherPort` is a plain object type - an adapter keeps the getter live rather
     // than snapshotting `status` once at wiring time.
@@ -276,7 +325,7 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     }
   })
 
-  return { settings, bus, zones, watcher, obs, clipper, disposeIpc }
+  return { settings, bus, zones, characters, watcher, obs, clipper, disposeIpc }
 }
 
 /**
@@ -349,6 +398,15 @@ async function shutdown(services: Services): Promise<void> {
     services.zones.stop()
   } catch (error) {
     log('shutdown/zones', error)
+  }
+
+  // Detaching the character tracker keeps its DETECTION - `stop()` only unsubscribes.
+  // That matters because the last thing persisted is what identifies the player on the
+  // next launch, and level-ups are far too sparse to re-learn on demand.
+  try {
+    services.characters.stop()
+  } catch (error) {
+    log('shutdown/characters', error)
   }
 
   // 4. OBS last: it holds the socket and the reconnect timer, and step 3 may still

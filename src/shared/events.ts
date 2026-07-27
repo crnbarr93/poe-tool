@@ -157,8 +157,28 @@ export interface AreaGeneratedEvent extends PoeEventBase {
 }
 
 /**
- * Something died. Source line:
+ * HOW a character stopped being alive. The discriminator on {@link DeathEvent}.
+ *
+ *  - `'slain'` is a normal death - the game killed you. Source line:
+ *    `... : FyascoWorbinTime has been slain.` (348 occurrences in the reference log.)
+ *  - `'suicide'` is PoE's `/kill` command, which is DELIBERATE and MUST NEVER
+ *    TRIGGER A CLIP. Source line:
+ *    `... : LargeThumbThomasReturns has committed suicide.` (7 occurrences.)
+ *    Players type `/kill` to leave a map instantly or to reset a boss fight; a clip
+ *    of that is thirty seconds of nothing followed by a self-inflicted death.
+ *
+ * A suicide is still a real {@link DeathEvent}: it is published on `death` (and on
+ * `death:self` when it is ours) so death counts and the event feed stay honest. The
+ * ONE consumer that must special-case it is the replay clipper, which filters on
+ * this field. Doing the filtering there rather than on the bus is deliberate - the
+ * bus's job is to report what happened, not to decide what is interesting.
+ */
+export type DeathCause = 'slain' | 'suicide'
+
+/**
+ * Something died. Source lines:
  * `... [INFO Client 50396] : FyascoWorbinTime has been slain.`
+ * `... [INFO Client 42816] : LargeThumbThomasReturns has committed suicide.`
  *
  * Gated on the system marker, so a player typing `Bob has been slain.` in chat
  * cannot trigger this. PoE character names contain no spaces, so the name pattern
@@ -173,18 +193,68 @@ export interface DeathEvent extends PoeEventBase {
   /** The slain character's name exactly as logged. */
   readonly characterName: string
   /**
-   * True when `characterName` matches the configured `settings.character.name`.
-   * Comparison is case-insensitive + trimmed. When no character name is configured
-   * this is ALWAYS false (we cannot know, so we refuse to guess and the clipper
-   * stays idle).
+   * Whether the game killed this character or the player typed `/kill`. See
+   * {@link DeathCause}: `'suicide'` must never produce a clip, but still counts.
+   */
+  readonly cause: DeathCause
+  /**
+   * True when `characterName` matches the RESOLVED active character - the manual
+   * `settings.character.override` when it is non-empty, otherwise the auto-detected
+   * `settings.character.detected` (see {@link ActiveCharacter}).
+   * Comparison is case-insensitive + trimmed. When neither is known this is ALWAYS
+   * false (we cannot know, so we refuse to guess and the clipper stays idle - which
+   * is why "nothing detected yet" has to be surfaced loudly in the UI rather than
+   * left to fail quietly).
    */
   readonly isSelf: boolean
 }
 
-/** Every event the log layer can produce. Exhaustively switchable on `type`. */
-export type PoeEvent = ZoneEnteredEvent | AreaGeneratedEvent | DeathEvent
+/**
+ * The player levelled up. Source line:
+ * `... [INFO Client 24036] : LargeThumbThomasReturns (Marauder) is now level 2`
+ *
+ * Gated on the system marker like the other chat-shaped lines. Note there is NO
+ * trailing period on this one.
+ *
+ * This is the ONLY line in Client.txt that names a character and identifies it as
+ * the one being played, which makes it the sole basis for auto-detection. It is also
+ * SPARSE: a level-98 character can play for weeks without producing one. Anything
+ * derived from it therefore has to be PERSISTED (see `settings.character.detected`),
+ * because a single level-up ever must be enough, across app restarts.
+ *
+ * WHOSE level-ups appear is NOT fully established. The reference log has 585 of these
+ * lines carrying NINE distinct names - the six alts that also die in it, plus three
+ * that never die and never speak in chat (one of them levelling 2 -> 8 in a single
+ * uninterrupted quarter of an hour), which all look like more of the same player's
+ * own characters. So this log shows a detector nothing worse than "the user swapped
+ * alt", and taking the most recent name is a sound default. It does NOT prove a party
+ * member's level-up stays out of our log. `settings.character.override` exists exactly
+ * so that unanswered question cannot break group play - see {@link ActiveCharacter}.
+ * The resolution rules live with the detector, not here.
+ */
+export interface LevelUpEvent extends PoeEventBase {
+  readonly type: 'level-up'
+  /** The character's name exactly as logged, e.g. `"LargeThumbThomasReturns"`. */
+  readonly characterName: string
+  /**
+   * The class in parentheses, e.g. `"Marauder"`. This is the BASE class until the
+   * character ascends and the ASCENDANCY afterwards - the reference log contains
+   * Marauder, Berserker, Slayer, Duelist, Elementalist, Witch and Ranger for the same
+   * six characters. So it is display metadata, NOT a stable identity: never key
+   * anything on it, and expect it to change under a fixed `characterName`.
+   *
+   * Class names contain spaces in no observed case, but the type does not rely on
+   * that - treat it as free text.
+   */
+  readonly className: string
+  /** The new level, e.g. `2`. PoE 1 caps at 100. */
+  readonly level: number
+}
 
-/** `'zone-entered' | 'area-generated' | 'death'`. */
+/** Every event the log layer can produce. Exhaustively switchable on `type`. */
+export type PoeEvent = ZoneEnteredEvent | AreaGeneratedEvent | DeathEvent | LevelUpEvent
+
+/** `'zone-entered' | 'area-generated' | 'death' | 'level-up'`. */
 export type PoeEventType = PoeEvent['type']
 
 /**
@@ -232,6 +302,51 @@ export interface CurrentZone {
   readonly seed: number | null
   /** `Date.now()` when this zone became current. */
   readonly enteredAt: number
+}
+
+/**
+ * WHO COUNTS AS "ME" RIGHT NOW - the resolved answer, not the raw settings.
+ *
+ * Produced by merging the two halves of `settings.character`, in this priority order
+ * (which {@link source} records, so the UI can explain itself):
+ *
+ *  1. `'override'` - `settings.character.override` is non-empty. A MANUAL choice
+ *     always wins. It exists for GROUP PLAY: if a party member's level-up reaches our
+ *     Client.txt (see {@link LevelUpEvent} - the reference log neither proves nor
+ *     disproves that it does), auto-detection would honestly land on the wrong person
+ *     and every subsequent death of ours would read as someone else's. Typing a name
+ *     settles it without the detector having to be right.
+ *  2. `'detected'` - no override, but a {@link LevelUpEvent} has been seen at some
+ *     point and persisted to `settings.character.detected`. Persisted precisely
+ *     because level-ups are sparse (see {@link LevelUpEvent}): one ever, at any time
+ *     in the past, must survive restarts.
+ *  3. `'none'` - nothing configured and nothing ever detected. `name` is then null
+ *     and EVERY `DeathEvent.isSelf` is false, so the clipper never fires. That is a
+ *     silent no-op from the user's point of view, and therefore must be surfaced as
+ *     a warning with a one-click picker of names harvested from the log
+ *     (`character:suggestions`) rather than left to be discovered by a missing clip.
+ *
+ * `name` is `null` if and only if `source === 'none'`. The type does not encode that
+ * as a discriminated union on purpose: consumers overwhelmingly want "the name, or
+ * null", and a three-arm switch at every call site would be noise.
+ *
+ * {@link className} and {@link level} are independently nullable even when a name is
+ * known: an override is just a name the user typed, so its class and level stay null
+ * until a level-up for that character is actually observed.
+ */
+export interface ActiveCharacter {
+  /** The resolved character name, or `null` when nothing is configured or detected. */
+  readonly name: string | null
+  /**
+   * Class or ascendancy as of the last observed level-up, e.g. `"Marauder"`,
+   * `"Berserker"`. Null when unknown - including for a name that only came from the
+   * override. Display only; see {@link LevelUpEvent.className}.
+   */
+  readonly className: string | null
+  /** Level as of the last observed level-up. Null when unknown. Display only. */
+  readonly level: number | null
+  /** Which rule produced {@link name}. See the priority list above. */
+  readonly source: 'override' | 'detected' | 'none'
 }
 
 // ---------------------------------------------------------------------------
@@ -341,6 +456,18 @@ export type WatcherStatus =
  *  - `death` carries all deaths including party members; `death:self` is the
  *    pre-filtered stream (`isSelf === true`) that the replay clipper listens on, so
  *    the clipper never needs to know about the character-name setting.
+ *  - `death:self` carries SUICIDES TOO (`cause === 'suicide'`). It is filtered by
+ *    WHOSE death it is, never by whether the death is interesting. The replay
+ *    clipper does the `cause` filtering itself - see {@link DeathCause}.
+ *  - `level-up` fires for party members' level-ups as well as ours, exactly like
+ *    `death`. There is no `level-up:self` channel: unlike a death, a level-up is what
+ *    ESTABLISHES who "self" is, so pre-filtering it on the current answer would make
+ *    detection unable to bootstrap.
+ *
+ * `zone-changed` and `character-changed` are DERIVED STATE, not parse results: they
+ * carry a complete current-value snapshot and are emitted only when that snapshot
+ * actually changes, so a listener can render straight from the payload. Neither is
+ * ever emitted by `publish` - the zone tracker and the character detector own them.
  */
 export interface PoeEventMap {
   event: [PoeEvent]
@@ -348,7 +475,9 @@ export interface PoeEventMap {
   'area-generated': [AreaGeneratedEvent]
   death: [DeathEvent]
   'death:self': [DeathEvent]
+  'level-up': [LevelUpEvent]
   'zone-changed': [CurrentZone]
+  'character-changed': [ActiveCharacter]
   unmatched: [UnmatchedLine]
   'watcher-status': [WatcherStatus]
 }
@@ -373,6 +502,17 @@ export function isPoeEvent(r: ParseResult): r is PoeEvent {
 /** Narrows a {@link ParseResult} to a {@link DeathEvent}. */
 export function isDeathEvent(r: ParseResult): r is DeathEvent {
   return r.type === 'death'
+}
+
+/**
+ * Narrows a {@link ParseResult} to a {@link LevelUpEvent}.
+ *
+ * Deliberately does NOT also test the cause/class/level fields: `type` is the
+ * discriminant, and a guard that second-guesses the parser would let a malformed
+ * event vanish silently instead of surfacing where it was built.
+ */
+export function isLevelUpEvent(r: ParseResult): r is LevelUpEvent {
+  return r.type === 'level-up'
 }
 
 /** Narrows a {@link ParseResult} to a {@link ZoneEnteredEvent}. */

@@ -44,7 +44,7 @@ import { mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 
-import type { CurrentZone } from '../../shared/events'
+import type { CurrentZone, DeathCause } from '../../shared/events'
 import type { ClipRecord } from '../../shared/ipc'
 import { applyCollisionSuffix, buildClipBasename, extensionFromPath } from './clip-namer'
 
@@ -206,6 +206,16 @@ export interface MoveClipOptions {
   /** Configured character name, `""` when unconfigured. Recorded, not put in the filename. */
   readonly characterName: string
   /**
+   * Which kind of death produced this clip. Copied onto `ClipRecord.cause`; like
+   * {@link characterName} it is recorded, never used in the filename.
+   *
+   * In practice always `'slain'`: the replay clipper drops a `'suicide'` (PoE's
+   * `/kill`) at admission, so one never reaches a move. This library does not enforce
+   * that - it files whatever it is handed - so do not read a record's `cause` as proof
+   * of what the clipper's policy was at the time.
+   */
+  readonly cause: DeathCause
+  /**
    * True when OBS is running on another machine, i.e. `sourcePath` is not this
    * machine's filesystem. Suppresses the move entirely.
    */
@@ -358,7 +368,8 @@ export class ClipLibrary {
       zoneName: opts.zone.displayName,
       areaId: opts.zone.areaId,
       areaLevel: opts.zone.areaLevel,
-      characterName: opts.characterName
+      characterName: opts.characterName,
+      cause: opts.cause
     }
   }
 
@@ -459,6 +470,16 @@ export class ClipLibrary {
    * it, a truncated file would be left in the library under the final clip name,
    * indistinguishable from a real clip in a directory listing, and it would burn the
    * collision namespace so a genuine retry of the same second/zone landed on `-2`.
+   *
+   * THE GUARD COVERS THE VERIFICATION TOO, not just the copy. Once bytes have been
+   * written to `destination`, EVERY path out of this method that is not "the clip is
+   * now in the library" has to remove them - and `sizeOf` is a `stat`, which is
+   * exactly the call antivirus and the Windows indexer make fail with EPERM/EBUSY on
+   * a file that was written a millisecond ago (see {@link RETRYABLE_CODES}). A throw
+   * escaping the verification uncleaned is WORSE than the truncated-copy case it was
+   * modelled on: the orphan is FULL SIZE, so it looks like a perfectly good clip in a
+   * directory listing while the record says `moved: false` / `finalPath: null` and
+   * sends the user back to the OBS path.
    */
   async #copyThenUnlink(source: string, destination: string): Promise<string | null> {
     try {
@@ -471,8 +492,18 @@ export class ClipLibrary {
     // Stat both AFTER the copy: comparing against a size sampled beforehand would
     // false-positive on a file OBS is still flushing, and the failure mode we care
     // about (a truncated write) is only visible once the stream has ended.
-    const sourceSize = await this.#fs.sizeOf(source)
-    const destinationSize = await this.#fs.sizeOf(destination)
+    let sourceSize: number
+    let destinationSize: number
+    try {
+      sourceSize = await this.#fs.sizeOf(source)
+      destinationSize = await this.#fs.sizeOf(destination)
+    } catch (error) {
+      // Unverifiable is treated as unmoved: the source is still whole, so discarding
+      // the copy costs nothing and is the only outcome that leaves the two ends of
+      // this operation agreeing with each other.
+      await this.#discard(destination)
+      throw error
+    }
 
     if (sourceSize !== destinationSize) {
       await this.#discard(destination)

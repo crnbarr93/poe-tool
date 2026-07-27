@@ -13,7 +13,13 @@
  *    two hours ago. Seeing them tagged is how a user tells "poe-tool ignored my death"
  *    apart from "poe-tool never saw my death".
  *  - a death row says whether it was YOU or a party member, because that single
- *    distinction is the whole reason `character.name` exists.
+ *    distinction is the whole reason the active character exists.
+ *  - a death by `/kill` says so AND says it was not clipped. It is the one case where a
+ *    death of yours legitimately produces no clip, so leaving it looking like an ordinary
+ *    death would make the app look broken at the exact moment it is behaving correctly.
+ *  - a level-up row is the detector's evidence. These lines are the ONLY basis for
+ *    auto-detecting the active character and they are sparse, so seeing one arrive is how
+ *    a user connects "I levelled" to "the warning went away".
  *  - `seed 1` is called out as a static area (town/hideout), matching the meaning
  *    documented on `AreaGeneratedEvent`.
  *
@@ -60,10 +66,26 @@ function describeEvent(event: PoeEvent): EventRowContent {
       }
     case 'death':
       return {
-        tone: event.isSelf ? 'bad' : 'warn',
-        typeLabel: 'death',
+        // A suicide is never a highlight and never a clip, so it is not tinted like a
+        // real death even when it is ours.
+        tone: event.cause === 'suicide' ? 'idle' : event.isSelf ? 'bad' : 'warn',
+        typeLabel: event.cause === 'suicide' ? '/kill' : 'death',
         subject: event.characterName,
-        detail: event.isSelf ? 'you' : 'party member — ignored'
+        detail:
+          event.cause === 'suicide'
+            ? event.isSelf
+              ? 'you — deliberate, never clipped'
+              : 'party member — ignored'
+            : event.isSelf
+              ? 'you'
+              : 'party member — ignored'
+      }
+    case 'level-up':
+      return {
+        tone: 'info',
+        typeLabel: 'level',
+        subject: event.characterName,
+        detail: `${event.className} · now level ${event.level}`
       }
   }
 }

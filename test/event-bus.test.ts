@@ -18,6 +18,7 @@ import { parseLine } from '../src/main/log/parse-line'
 import type {
   AreaGeneratedEvent,
   DeathEvent,
+  LevelUpEvent,
   ParseResult,
   PoeEventChannel,
   UnmatchedLine,
@@ -34,6 +35,12 @@ const ZONE_LINE =
   '2026/07/26 19:28:42 1018543171 cffb0658 [INFO Client 50396] : You have entered Karui Shores.'
 const AREA_LINE =
   '2026/07/26 19:28:41 1018542484 1186a8a3 [DEBUG Client 50396] Generating level 69 area "2_11_endgame_town" with seed 1'
+/** PoE's `/kill`. A real death - it just must never become a clip. */
+const SUICIDE_LINE =
+  '2025/07/13 09:52:01 176574078 cff945b9 [INFO Client 42816] : LargeThumbThomasReturns has committed suicide.'
+/** The line auto-detection is built on. Verbatim; note the absent trailing period. */
+const LEVEL_UP_LINE =
+  '2026/07/26 13:26:59 996840125 cffb0658 [INFO Client 53252] : FyascoWorbinTime (Elementalist) is now level 92'
 /** Player chat: the system marker is absent, so nothing may ever match it. */
 const CHAT_LINE =
   '2026/07/26 19:26:31 1018412156 cffb0658 [INFO Client 50396] Bob: FyascoWorbinTime has been slain.'
@@ -44,7 +51,14 @@ function parse(line: string, selfName = 'FyascoWorbinTime', backlog = false): Pa
   return parseLine(line, { detectedAt: DETECTED_AT, backlog, selfName })
 }
 
-/** Records every channel a publish touched, in order, with the payload. */
+/**
+ * Records every channel a publish touched, in order, with the payload.
+ *
+ * SUBSCRIBES TO EVERY CHANNEL IN `PoeEventMap`, including the derived-state ones
+ * (`zone-changed`, `character-changed`) that `publish` must never touch. That is
+ * what turns each `toEqual` below into a statement about the whole bus rather than
+ * about the handful of channels a test happened to think of.
+ */
 function recorder(bus: PoeEventBus): Array<[PoeEventChannel, unknown]> {
   const seen: Array<[PoeEventChannel, unknown]> = []
   bus.on('event', (e) => seen.push(['event', e]))
@@ -52,8 +66,10 @@ function recorder(bus: PoeEventBus): Array<[PoeEventChannel, unknown]> {
   bus.on('death:self', (e) => seen.push(['death:self', e]))
   bus.on('zone-entered', (e) => seen.push(['zone-entered', e]))
   bus.on('area-generated', (e) => seen.push(['area-generated', e]))
+  bus.on('level-up', (e) => seen.push(['level-up', e]))
   bus.on('unmatched', (e) => seen.push(['unmatched', e]))
   bus.on('zone-changed', (z) => seen.push(['zone-changed', z]))
+  bus.on('character-changed', (c) => seen.push(['character-changed', c]))
   bus.on('watcher-status', (s) => seen.push(['watcher-status', s]))
   return seen
 }
@@ -131,6 +147,53 @@ describe('PoeEventBus.publish fan-out', () => {
     expect(channelsOf(seen)).toEqual(['event', 'area-generated'])
   })
 
+  it('sends a level-up to event and level-up only', () => {
+    const bus = new PoeEventBus()
+    const seen = recorder(bus)
+
+    const parsed = parse(LEVEL_UP_LINE)
+    expect(parsed.type).toBe('level-up')
+    expect((parsed as LevelUpEvent).characterName).toBe('FyascoWorbinTime')
+    expect((parsed as LevelUpEvent).level).toBe(92)
+
+    bus.publish(parsed)
+
+    // `character-changed` is DERIVED state and belongs to the character tracker.
+    // This channel is the raw observation; the tracker decides what it means.
+    expect(channelsOf(seen)).toEqual(['event', 'level-up'])
+  })
+
+  it("sends someone else's level-up out unfiltered, with no :self variant", () => {
+    const bus = new PoeEventBus()
+    const seen = recorder(bus)
+
+    // Resolved character is somebody else entirely - and it changes nothing.
+    bus.publish(parse(LEVEL_UP_LINE, 'SomebodyElse'))
+
+    // There is deliberately no `level-up:self`: a level-up is the evidence that
+    // ESTABLISHES who self is, so filtering it on the current answer would leave
+    // detection unable to bootstrap from "nothing known".
+    expect(channelsOf(seen)).toEqual(['event', 'level-up'])
+  })
+
+  it('sends a SUICIDE to death and death:self like any other death', () => {
+    const bus = new PoeEventBus()
+    const seen = recorder(bus)
+
+    const parsed = parse(SUICIDE_LINE, 'LargeThumbThomasReturns')
+    expect(parsed.type).toBe('death')
+    expect((parsed as DeathEvent).cause).toBe('suicide')
+    expect((parsed as DeathEvent).isSelf).toBe(true)
+
+    bus.publish(parsed)
+
+    // The bus reports what happened; it does not decide what is interesting. A
+    // `/kill` still counts for death stats and still belongs in the event feed.
+    // Refusing to CLIP it is the replay clipper's job, and it filters on `cause` -
+    // so this channel must keep carrying suicides for that filter to exist at all.
+    expect(channelsOf(seen)).toEqual(['event', 'death', 'death:self'])
+  })
+
   it('sends an unmatched line to unmatched and NOT to event', () => {
     const bus = new PoeEventBus()
     const seen = recorder(bus)
@@ -198,6 +261,24 @@ describe('PoeEventBus listener containment', () => {
     // must not cost the user their clip.
     expect(clipped).toHaveLength(1)
     expect(clipped[0]?.characterName).toBe('FyascoWorbinTime')
+  })
+
+  it('still reaches level-up when the event listener throws', () => {
+    const bus = new PoeEventBus()
+    const learned: LevelUpEvent[] = []
+
+    bus.on('event', () => {
+      throw new Error('the renderer window is gone')
+    })
+    bus.on('level-up', (event) => learned.push(event))
+
+    bus.publish(parse(LEVEL_UP_LINE))
+
+    // Same per-channel containment as `death:self`, and it matters for the same
+    // reason: a dead window must not be able to stop the app finding out who the
+    // player is - which would silently disable clipping for the whole session.
+    expect(learned).toHaveLength(1)
+    expect(learned[0]?.characterName).toBe('FyascoWorbinTime')
   })
 
   it('reports the channel each failure happened on', () => {

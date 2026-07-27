@@ -16,7 +16,7 @@
  * log tail loop. Everything that decides WHETHER to clip therefore happens there and
  * only there:
  *
- *   backlog?  ->  clips disabled?  ->  inside the debounce window?
+ *   backlog?  ->  a suicide?  ->  clips disabled?  ->  inside the debounce window?
  *
  * and everything that then TAKES TIME (asking OBS, waiting for the file, moving it)
  * is pushed onto an internal promise queue and awaited off the hot path. Two
@@ -32,6 +32,23 @@
  *     clip after the town the player respawned in rather than the zone they died in.
  *     The same goes for the character name and the sidecar setting: the record
  *     describes the moment of death, so it is built from the settings of that moment.
+ *
+ *
+ * WHY THE SUICIDE CHECK COMES BEFORE THE DEBOUNCE
+ * ----------------------------------------------
+ * `/kill` is a deliberate act - leaving a map instantly, resetting a boss - so it is
+ * never a highlight and never becomes a clip (see `DeathCause` in `../../shared/events`).
+ * It is dropped in the SECOND admission step, alongside the backlog check and ahead of
+ * everything that reads settings, because both of those tests are properties of the
+ * DEATH ITSELF rather than of the configuration.
+ *
+ * That position is not cosmetic. The debounce window is armed at admission, so a
+ * suicide admitted into the window would swallow the next five seconds of real deaths -
+ * and "`/kill`, respawn in town, run back, die for real" is an ordinary sequence, not a
+ * contrived one. Dropping the suicide before `#lastAdmittedAt` is touched keeps the
+ * window owned exclusively by deaths that actually produced a clip. The inverse holds
+ * too: a suicide inside a window opened by a real death reports itself as a suicide,
+ * because it never consults the window at all.
  *
  *
  * SERIALISATION
@@ -69,7 +86,7 @@
 
 import type { CurrentZone, DeathEvent } from '../../shared/events'
 import type { ClipRecord } from '../../shared/ipc'
-import type { AppSettings } from '../../shared/settings'
+import type { AppSettings, CharacterSettings } from '../../shared/settings'
 import { TypedEmitter } from '../events/typed-emitter'
 import type { EventListener } from '../events/typed-emitter'
 import type { MoveClipOptions } from './clip-library'
@@ -196,6 +213,26 @@ export interface ClipSkippedBacklogOutcome extends ClipOutcomeBase {
   readonly kind: 'skipped-backlog'
 }
 
+/**
+ * The player typed `/kill`, and PoE logged `<Name> has committed suicide.`
+ *
+ * NOT A FAILURE. Nothing went wrong: a deliberate suicide is never a highlight, so the
+ * clip is skipped on purpose (see `DeathCause` in `../../shared/events`). The death is
+ * still a real death everywhere else - it rides the `death` and `death:self` channels
+ * and counts towards any statistics - which is exactly why this outcome exists rather
+ * than a silent `return`: the user must be able to see that poe-tool noticed the death
+ * and chose not to clip it, instead of wondering where their clip went.
+ */
+export interface ClipSkippedSuicideOutcome extends ClipOutcomeBase {
+  readonly kind: 'skipped-suicide'
+  /**
+   * Who `/kill`ed, i.e. `death.characterName`. Duplicated out of the event so a UI
+   * rendering a list of outcomes does not have to reach into `death` for the one field
+   * this outcome is about.
+   */
+  readonly characterName: string
+}
+
 /** `settings.clips.enabled` is false. The master switch. */
 export interface ClipSkippedDisabledOutcome extends ClipOutcomeBase {
   readonly kind: 'skipped-disabled'
@@ -270,6 +307,7 @@ export interface ClipInternalErrorOutcome extends ClipOutcomeBase {
 export type ClipOutcome =
   | ClipClippedOutcome
   | ClipSkippedBacklogOutcome
+  | ClipSkippedSuicideOutcome
   | ClipSkippedDisabledOutcome
   | ClipSkippedDebouncedOutcome
   | ClipObsNotConnectedOutcome
@@ -295,8 +333,11 @@ const FAILURE_KINDS: ReadonlySet<ClipOutcomeKind> = new Set<ClipOutcomeKind>([
 /**
  * True for outcomes worth showing as an error.
  *
- * Deliberately EXCLUDES the three `skipped-*` kinds: backlog, disabled and debounced
- * are the pipeline working as designed, not something to alarm the user about.
+ * Deliberately EXCLUDES all four `skipped-*` kinds: backlog, suicide, disabled and
+ * debounced are the pipeline working as designed, not something to alarm the user
+ * about. `skipped-suicide` in particular is a DELIBERATE product decision rather than
+ * anything going wrong, so it is classified with the other skips - it still reaches the
+ * UI, because every outcome does, just not styled as a failure.
  * `move-failed` IS a failure even though the clip exists, because the clip is not
  * where the user was told to look for it.
  */
@@ -346,6 +387,27 @@ function unknownZone(at: number): CurrentZone {
 /** `"Karui Shores"` -> `" in Karui Shores"`, unknown zone -> `""`. */
 function zonePhrase(zone: CurrentZone): string {
   return zone.displayName === null || zone.displayName.trim() === '' ? '' : ` in ${zone.displayName}`
+}
+
+/**
+ * The name to stamp on the {@link ClipRecord}: the manual override when there is one,
+ * otherwise whatever was auto-detected, otherwise `""`.
+ *
+ * This is the `ActiveCharacter` priority from `../../shared/events` applied to the raw
+ * settings, and it is deliberately NOT re-deciding whose death this was - `death:self`
+ * already answered that. It only answers "what do we call the player on this record",
+ * which is why "" is an acceptable result: a clip whose owner is unknown is still a
+ * clip, and `ClipRecord.characterName` documents `""` as exactly that case.
+ *
+ * Both fields are already trimmed by `validateSettings`, but `getSettings` is an
+ * injected function, so this trims again for the same reason
+ * {@link normalizeDebounceMs} re-clamps: a hand-edited settings.json must not be able
+ * to put a stray space into a filename or a sidecar.
+ */
+function resolveCharacterName(character: CharacterSettings): string {
+  const override = character.override.trim()
+  if (override !== '') return override
+  return character.detected?.trim() ?? ''
 }
 
 /**
@@ -528,7 +590,23 @@ export class ReplayClipper {
         return
       }
 
-      // 2. Settings. Read fresh, and a throwing reader is fatal to THIS death: we
+      // 2. `/kill`. A deliberate suicide is never a highlight, so it is dropped here -
+      //    BEFORE the settings read and, critically, BEFORE the debounce window is
+      //    armed in step 5. See the file header: a `/kill` that consumed the window
+      //    would suppress the genuine death that follows it seconds later, which is
+      //    the normal shape of "reset the fight, run back in, die properly".
+      if (death.cause === 'suicide') {
+        this.#emitOutcome({
+          kind: 'skipped-suicide',
+          death,
+          at: this.#now(),
+          message: `${death.characterName} used /kill, so no clip was saved. poe-tool only clips deaths the game inflicted; the death still counts everywhere else.`,
+          characterName: death.characterName
+        })
+        return
+      }
+
+      // 3. Settings. Read fresh, and a throwing reader is fatal to THIS death: we
       //    cannot know whether clipping is even enabled, and clipping anyway would
       //    ignore a user who turned it off.
       let settings: AppSettings
@@ -546,7 +624,7 @@ export class ReplayClipper {
         return
       }
 
-      // 3. Master switch.
+      // 4. Master switch.
       if (!settings.clips.enabled) {
         this.#emitOutcome({
           kind: 'skipped-disabled',
@@ -557,7 +635,7 @@ export class ReplayClipper {
         return
       }
 
-      // 4. Leading-edge debounce: the FIRST death fires immediately, repeats inside
+      // 5. Leading-edge debounce: the FIRST death fires immediately, repeats inside
       //    the window are swallowed. A party wipe writes several deaths within a
       //    second and they all belong to one fight, i.e. one clip.
       const at = this.#now()
@@ -583,11 +661,11 @@ export class ReplayClipper {
       }
       this.#lastAdmittedAt = at
 
-      // 5. Freeze the context NOW - the player is about to resurrect in town.
+      // 6. Freeze the context NOW - the player is about to resurrect in town.
       this.#enqueue({
         death,
         zone: this.#zoneNow(at),
-        characterName: settings.character.name,
+        characterName: resolveCharacterName(settings.character),
         writeSidecar: settings.clips.writeSidecar,
         admittedAt: at
       })
@@ -720,6 +798,10 @@ export class ReplayClipper {
       when,
       zone: pending.zone,
       characterName: pending.characterName,
+      // Taken from the event rather than hardcoded to `'slain'`: it IS always `'slain'`
+      // here, because admission drops suicides, but reading it off the death keeps that
+      // a consequence of the filter instead of a second place to keep in sync with it.
+      cause: death.cause,
       isRemoteObs: this.#obs.isRemoteObs,
       writeSidecar: pending.writeSidecar
     }
@@ -739,6 +821,7 @@ export class ReplayClipper {
         areaId: pending.zone.areaId,
         areaLevel: pending.zone.areaLevel,
         characterName: pending.characterName,
+        cause: death.cause,
         moved: false,
         note: `Moving the clip failed: ${describeError(error)}. The clip is still at ${saved.value.savedReplayPath}.`
       }

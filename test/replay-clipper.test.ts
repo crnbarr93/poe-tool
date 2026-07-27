@@ -18,13 +18,23 @@
  *
  * The clock is injected everywhere, so the 5s debounce window is exercised in
  * microseconds and no test is timing-dependent.
+ *
+ * `cause: 'suicide'` (PoE's `/kill`) has its own section near the bottom. The tests
+ * there are as much about ORDER as about the skip itself: the suicide check has to
+ * happen before the debounce window is armed, and the only way to see that is to fire a
+ * real death straight after a `/kill` and watch it still clip.
  */
 
 import { describe, expect, it } from 'vitest'
 
 import type { CurrentZone, DeathEvent, LogLineMeta, PoeEventMap } from '../src/shared/events'
 import type { ClipRecord } from '../src/shared/ipc'
-import { DEFAULT_SETTINGS, type AppSettings, type ClipSettings } from '../src/shared/settings'
+import {
+  DEFAULT_SETTINGS,
+  type AppSettings,
+  type CharacterSettings,
+  type ClipSettings
+} from '../src/shared/settings'
 import { TypedEmitter } from '../src/main/events/typed-emitter'
 import type { MoveClipOptions } from '../src/main/obs/clip-library'
 import type { ObsError, ObsResult, SavedReplay } from '../src/main/obs/obs-client'
@@ -75,6 +85,7 @@ const DEATH_META: LogLineMeta = {
   body: 'FyascoWorbinTime has been slain.'
 }
 
+/** A normal, game-inflicted death. Pass `{ cause: 'suicide' }` for a `/kill`. */
 function death(overrides: Partial<DeathEvent> = {}): DeathEvent {
   return {
     type: 'death',
@@ -82,15 +93,23 @@ function death(overrides: Partial<DeathEvent> = {}): DeathEvent {
     detectedAt: 1_700_000_000_000,
     backlog: false,
     characterName: 'FyascoWorbinTime',
+    cause: 'slain',
     isSelf: true,
     ...overrides
   }
 }
 
-function settings(clips: Partial<ClipSettings> = {}, characterName = 'FyascoWorbinTime'): AppSettings {
+/**
+ * Settings with a manual override in place, so `ClipRecord.characterName` has a known
+ * value. Pass a `character` patch to exercise the override/detected priority.
+ */
+function settings(
+  clips: Partial<ClipSettings> = {},
+  character: Partial<CharacterSettings> = {}
+): AppSettings {
   return {
     ...DEFAULT_SETTINGS,
-    character: { name: characterName },
+    character: { ...DEFAULT_SETTINGS.character, override: 'FyascoWorbinTime', ...character },
     clips: { ...DEFAULT_SETTINGS.clips, libraryDir: '/library', ...clips }
   }
 }
@@ -170,7 +189,8 @@ class FakeClipLibrary implements ClipTarget {
         zoneName: options.zone.displayName,
         areaId: options.zone.areaId,
         areaLevel: options.zone.areaLevel,
-        characterName: options.characterName
+        characterName: options.characterName,
+        cause: options.cause
       }
       if (this.failWithNote !== null) {
         return { ...core, moved: false, finalPath: null, note: this.failWithNote }
@@ -276,7 +296,7 @@ describe('ReplayClipper - the happy path', () => {
   })
 
   it('hands the zone, character name and sidecar setting to the library', async () => {
-    const h = harness(settings({ writeSidecar: true }, 'FyascoWorbinTime'))
+    const h = harness(settings({ writeSidecar: true }))
     h.obs.isRemoteObs = true
 
     await h.die()
@@ -302,6 +322,41 @@ describe('ReplayClipper - the happy path', () => {
 
     expect(h.library.calls.at(0)?.zone).toEqual(KARUI_SHORES)
     expect(h.clips.at(0)?.zoneName).toBe('Karui Shores')
+  })
+
+  it('stamps the cause of death onto the record', async () => {
+    // Always `'slain'` in practice - a `/kill` is dropped at admission and never
+    // reaches the move - but it is read off the event rather than hardcoded, so this
+    // pins the plumbing rather than a constant.
+    const h = harness()
+
+    await h.die()
+
+    expect(h.library.calls.at(0)?.cause).toBe('slain')
+    expect(h.clips.at(0)?.cause).toBe('slain')
+  })
+
+  it('resolves the character name the way ActiveCharacter does: override, then detected', async () => {
+    // The override exists for group play, so it has to beat a detection that disagrees.
+    const h = harness(
+      settings({ debounceMs: 0 }, { override: 'LargeThumbThomasReturns', detected: 'Burgertrash' })
+    )
+
+    await h.die()
+
+    expect(h.library.calls.at(0)?.characterName).toBe('LargeThumbThomasReturns')
+
+    // Clearing the override falls back to the persisted detection rather than to "".
+    h.setSettings(settings({ debounceMs: 0 }, { override: '', detected: 'Burgertrash' }))
+    await h.die()
+
+    expect(h.library.calls.at(1)?.characterName).toBe('Burgertrash')
+
+    // Neither: still a clip, just an unattributed one.
+    h.setSettings(settings({ debounceMs: 0 }, { override: '', detected: null }))
+    await h.die()
+
+    expect(h.library.calls.at(2)?.characterName).toBe('')
   })
 
   it('emits an outcome that is not a failure', async () => {
@@ -416,6 +471,99 @@ describe('ReplayClipper - deaths that must not clip', () => {
 
     expect(h.obs.saveCalls).toBe(1)
     expect(h.kinds()).toEqual(['skipped-backlog', 'skipped-backlog', 'clipped'])
+  })
+
+  it('never clips a /kill, and says so instead of doing nothing', async () => {
+    const h = harness()
+
+    await h.die({ cause: 'suicide' })
+
+    expect(h.obs.statusCalls).toBe(0)
+    expect(h.obs.saveCalls).toBe(0)
+    expect(h.library.calls).toHaveLength(0)
+    expect(h.clips).toHaveLength(0)
+
+    // A distinct kind, not folded into skipped-disabled or a silent return: the user
+    // has to be able to see that the death was noticed and deliberately not clipped.
+    expect(h.kinds()).toEqual(['skipped-suicide'])
+    const outcome = h.last()
+    expect(outcome.kind).toBe('skipped-suicide')
+    if (outcome.kind === 'skipped-suicide') {
+      expect(outcome.characterName).toBe('FyascoWorbinTime')
+    }
+    expect(outcome.message).toContain('/kill')
+
+    // A deliberate skip, not a failure - it must not be styled as an error.
+    expect(isClipFailure(outcome)).toBe(false)
+  })
+
+  it('does not let a /kill consume the debounce window and suppress a real death', async () => {
+    // THE ORDERING TEST. `/kill` to reset a fight, respawn, run back in, die for real -
+    // all inside five seconds. If the suicide check ran after the debounce was armed,
+    // the genuine death would be swallowed as a repeat and no clip would ever be saved.
+    const h = harness()
+
+    await h.die({ cause: 'suicide' })
+    h.setNow(1_000)
+    await h.die()
+
+    expect(h.obs.saveCalls).toBe(1)
+    expect(h.library.calls).toHaveLength(1)
+    expect(h.kinds()).toEqual(['skipped-suicide', 'clipped'])
+  })
+
+  it('reports a /kill inside an open window as a suicide, and does not extend the window', async () => {
+    // The suicide check comes first, so a `/kill` never reaches the debounce at all -
+    // neither to be reported by it nor to push its expiry out.
+    const h = harness()
+
+    await h.die() // t=0: clipped, window runs to t=5000.
+    h.setNow(1_000)
+    await h.die({ cause: 'suicide' })
+    h.setNow(4_000)
+    await h.die() // Still inside the ORIGINAL window, not one restarted at t=1000.
+    h.setNow(6_000)
+    await h.die()
+
+    expect(h.kinds()).toEqual(['clipped', 'skipped-suicide', 'skipped-debounced', 'clipped'])
+    expect(h.obs.saveCalls).toBe(2)
+  })
+
+  it('drops a /kill before it reads the settings at all', async () => {
+    // A suicide is a property of the death, not of the configuration, so no setting can
+    // make one clip and none is needed to reject one. Proven with a reader that throws:
+    // if the settings were consulted first this would be an internal-error instead.
+    const bus = new TypedEmitter<PoeEventMap>()
+    const obs = new FakeObsClient()
+    const clipper = new ReplayClipper({
+      bus,
+      obs,
+      library: new FakeClipLibrary(),
+      getSettings: () => {
+        throw new Error('settings.json is on fire')
+      },
+      getZone: () => KARUI_SHORES,
+      clock: () => 0
+    })
+    const outcomes: ClipOutcome[] = []
+    clipper.on('outcome', (outcome) => outcomes.push(outcome))
+
+    bus.emit('death:self', death({ cause: 'suicide' }))
+    await clipper.idle()
+
+    expect(outcomes.map((outcome) => outcome.kind)).toEqual(['skipped-suicide'])
+    expect(obs.saveCalls).toBe(0)
+  })
+
+  it('still reports a historical /kill as backlog', async () => {
+    // Backlog stays the first test: the reason a replayed line is ignored is that it is
+    // old, whatever kind of death it was.
+    const h = harness()
+
+    await h.die({ cause: 'suicide', backlog: true })
+
+    expect(h.kinds()).toEqual(['skipped-backlog'])
+    expect(h.obs.saveCalls).toBe(0)
   })
 
   it('does nothing when clips are disabled, and does not consume the window', async () => {
@@ -653,6 +801,8 @@ describe('ReplayClipper - move failures', () => {
     expect(record?.originalPath).toBe('C:\\Users\\me\\Videos\\Replay-1.mkv')
     expect(record?.note).toContain('EPERM')
     expect(record?.zoneName).toBe('Karui Shores')
+    // The synthesised record is a full ClipRecord, cause included.
+    expect(record?.cause).toBe('slain')
   })
 
   it('does not stop the next death from clipping', async () => {
