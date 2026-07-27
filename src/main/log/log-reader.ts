@@ -435,6 +435,29 @@ export class LogReader {
       handle = await fs.open(this.#path, 'r')
       const stat = await handle.stat()
 
+      // NOT A REGULAR FILE -> read-error, checked BEFORE any offset or rotation logic.
+      //
+      // This is a genuine platform split, caught by the first Windows CI run. Opening a
+      // DIRECTORY read-only fails on POSIX (the read raises EISDIR) but SUCCEEDS on
+      // Windows, where the handle then reports size 0 forever. Without this guard a
+      // mistyped path - `...\logs` instead of `...\logs\Client.txt`, which is an easy
+      // slip - makes the app report a healthy `ok` and tail nothing for the rest of the
+      // session: the status badge says "tailing", no error is ever raised, and no death
+      // is ever clipped. Failing loudly here is the whole point.
+      //
+      // `isFile()` also rejects the other non-file cases uniformly (block/char devices,
+      // FIFOs, sockets), so behaviour no longer depends on which OS is running.
+      if (!stat.isFile()) {
+        return {
+          lines: [],
+          rotated: false,
+          backlog: false,
+          bytesRead: 0,
+          status: 'read-error',
+          error: `not a regular file: ${this.#path}`
+        }
+      }
+
       const rotated = await this.#detectRotation(handle, stat.size, stat.birthtimeMs)
       if (rotated) {
         this.#offset = 0

@@ -5,22 +5,28 @@
 # It deliberately does NOT run electron-builder - packaging is slow, only matters
 # for a release, and lives in release.yml.
 #
-# WHY ubuntu-latest AND NOT windows-latest
-# ----------------------------------------
-# poe-tool only ever *ships* for Windows, but nothing these two checks do is
-# Windows specific, and ubuntu runners are the fastest and cheapest tier:
-#   - `npm run typecheck` is pure tsc: no OS-dependent behaviour.
-#   - `npm test` is pure Node under vitest: no Electron binary is launched, no
-#     window is opened, no display server is needed.
-# The suite is platform independent BY CONSTRUCTION, not by luck. The tests that
-# reason about Windows paths (test/default-paths.test.ts, test/clip-namer.test.ts)
-# assert against `path.win32` explicitly and build their environment from
-# hand-written objects instead of reading the real `process.env`, precisely so the
-# same assertions hold on a non-Windows machine. See the header comments in those
-# files before assuming a failure here is an "it only breaks on Linux" problem.
+# WHY THIS RUNS ON WINDOWS TOO
+# ----------------------------
+# This file used to run on ubuntu-latest alone, arguing that the suite was
+# "platform independent BY CONSTRUCTION, not by luck". The first windows-latest
+# run disproved it in one shot: test/log-reader.test.ts asserted that pointing the
+# reader at a DIRECTORY yields `read-error`, which held on POSIX (the read raises
+# EISDIR) but not on Windows, where `open` on a directory SUCCEEDS and reports
+# size 0. The reader answered `ok` and would have tailed nothing forever behind a
+# healthy status badge.
 #
-# The real Windows packaging path is still exercised - on a native windows-latest
-# runner in release.yml - so nothing Windows specific escapes CI entirely.
+# That bug was only catchable on a Windows runner, and before this matrix the only
+# Windows runner in the repo was in release.yml - i.e. it could not be caught
+# until release time, which is the worst moment to discover it. The app ships for
+# Windows exclusively, so Windows is the platform that actually matters and it now
+# gates every PR.
+#
+# ubuntu is kept in the matrix because it is the fastest tier and catches
+# POSIX-only regressions in the dev loop (the maintainer works on macOS, which is
+# closer to ubuntu than to the shipping target).
+#
+# Still no electron-builder here - packaging is slow, only matters for a release,
+# and lives in release.yml.
 
 name: CI
 
@@ -47,8 +53,17 @@ concurrency:
 
 jobs:
   check:
-    name: Typecheck and test
-    runs-on: ubuntu-latest
+    name: Typecheck and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      # Never cancel the Windows leg because the ubuntu leg went red (or vice
+      # versa). When a failure IS platform specific, seeing both results is the
+      # whole diagnostic - that contrast is what identified the directory-open
+      # split described in the header.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
 
     steps:
       - name: Check out repository
