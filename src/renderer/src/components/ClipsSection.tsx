@@ -15,15 +15,35 @@
  * turn "your clip is in the OBS folder instead of your library" into "poe-tool lost my
  * clip". So an unmoved clip keeps its row, gets a coloured rail, states plainly where
  * the file actually is, and always shows its note.
+ *
+ * THE SAME RULE, APPLIED AGAIN TO UPLOADS
+ * ---------------------------------------
+ * Every row also carries its Streamable upload state, and the two unhappy endings are as
+ * visible as the happy one. `skipped` (we chose not to - the file is over the free-plan
+ * size cap, the clip is not on this machine, no credentials) and `failed` (we tried and
+ * could not) are different sentences for different problems, and neither is greyed out or
+ * hidden behind a hover. A user who believes their deaths are being uploaded and finds
+ * out weeks later that a size limit quietly dropped them is the exact outcome this
+ * project exists to avoid.
+ *
+ * The upload state on the row is LIVE: `ClipRecord.upload` is only a snapshot from when
+ * the record was sent, and `useClipFeed` folds `push:clip-upload` into the row as the
+ * upload progresses. See its note in `../hooks.ts`.
+ *
+ * AND A FAILURE CAN STILL HAVE A LINK. When the upload itself worked and only the wait for
+ * transcoding ran out - the poll cap, or a quit mid-poll - main sends the shortcode and URL
+ * on the `failed`/`skipped` outcome, and the row shows them exactly as `done` would. The
+ * video is on Streamable; the only thing that failed was poe-tool watching it.
  */
 
 import type { ReactElement } from 'react'
 
-import type { ClipRecord, PoeToolApi } from '../../../shared/ipc'
+import type { ClipRecord, PoeToolApi, UploadOutcome } from '../../../shared/ipc'
 import type { AppSettings, DeepPartial } from '../../../shared/settings'
 import { DEBOUNCE_MS_MAX, DEBOUNCE_MS_MIN } from '../../../shared/settings'
 import { fileNameOf, formatEpochDateTime } from '../format'
 import { useClipFeed } from '../hooks'
+import { CopyButton } from './CopyButton'
 import { NumberField, TextField, ToggleField } from './Fields'
 import { Section } from './Section'
 import { StatusBadge } from './StatusBadge'
@@ -67,6 +87,139 @@ function CauseTag({ cause }: { readonly cause: ClipRecord['cause'] }): ReactElem
   )
 }
 
+/**
+ * One clip's Streamable upload, inline on its row.
+ *
+ * EXHAUSTIVE over {@link UploadOutcome} - a new upload state is a compile error here
+ * rather than a row that silently renders nothing.
+ *
+ * WHY `processing` SHOWS A SHORTCODE AND NOT A LINK
+ * ------------------------------------------------
+ * The video does exist at that address from the moment Streamable accepts it, but
+ * `UploadProcessing` deliberately carries only the shortcode: URLs are assembled in main
+ * so that there is exactly one place that knows what a Streamable URL looks like. Building
+ * one here to save the user a few seconds would put a second copy of that knowledge in the
+ * renderer, and the saving is a link that does not play yet anyway. `done` carries the
+ * real `url` and that is what gets linked.
+ */
+function UploadState({ upload }: { readonly upload: UploadOutcome }): ReactElement {
+  switch (upload.state) {
+    case 'disabled':
+      return (
+        <div className="clip__upload">
+          <span
+            className="tag tag--idle"
+            title="Streamable uploading is switched off, so this clip was never a candidate."
+          >
+            not uploaded
+          </span>
+        </div>
+      )
+
+    case 'pending':
+      return (
+        <div className="clip__upload">
+          <span className="tag tag--info">upload queued</span>
+        </div>
+      )
+
+    case 'uploading':
+      return (
+        <div className="clip__upload">
+          <span className="tag tag--info">uploading</span>
+          {/*
+            `percent: null` is the NORMAL case, not a missing value: the upload is one
+            fetch of a multipart body and the platform gives no per-chunk callback. Saying
+            "in progress" is honest; rendering "0%" would look stuck.
+          */}
+          <span className="clip__upload-note">
+            {upload.percent === null ? 'in progress' : `${upload.percent}%`}
+          </span>
+        </div>
+      )
+
+    case 'processing':
+      return (
+        <div className="clip__upload">
+          <span className="tag tag--info">processing</span>
+          <span className="clip__upload-note">
+            Streamable has the file and is transcoding it — the link appears when it can be
+            played.
+          </span>
+          <span className="mono clip__upload-code">{upload.shortcode}</span>
+        </div>
+      )
+
+    case 'done':
+      return (
+        <div className="clip__upload">
+          <span className="tag tag--ok">uploaded</span>
+          {/*
+            `target="_blank"` is REQUIRED, not habit. `src/main/index.ts` blocks in-page
+            navigation outright (replacing this document would hand a remote origin the
+            preload bridge) and routes window-open requests to `shell.openExternal`, so a
+            plain same-window link would simply do nothing. `rel="noreferrer"` because
+            Streamable has no business knowing where the click came from.
+          */}
+          <a className="clip__link" href={upload.url} target="_blank" rel="noreferrer">
+            {upload.url}
+          </a>
+          <CopyButton text={upload.url} label="Copy link" srLabel="Streamable link" />
+        </div>
+      )
+
+    case 'skipped':
+      return (
+        <div className="clip__upload">
+          <span className="tag tag--warn">not uploaded</span>
+          {/*
+            `reason` is a complete sentence written in main and safe to render verbatim.
+            It is shown in a block, at full contrast, because a skip is a decision the
+            user is entitled to disagree with - and the clip is still on disk either way.
+          */}
+          <p className="clip__note clip__note--problem">{upload.reason}</p>
+          <UploadedLink url={upload.url} />
+        </div>
+      )
+
+    case 'failed':
+      return (
+        <div className="clip__upload">
+          <span className="tag tag--bad">upload failed</span>
+          <p className="clip__note clip__note--failed">
+            {upload.message} The clip itself is untouched — a failed upload never costs you
+            the file.
+          </p>
+          <UploadedLink url={upload.url} />
+        </div>
+      )
+  }
+}
+
+/**
+ * The link on an unhappy ending that nonetheless produced a video.
+ *
+ * `skipped` and `failed` carry a `url` in exactly one situation: the upload SUCCEEDED and
+ * then poe-tool stopped watching the transcode - the poll cap ran out, or the app quit
+ * mid-poll. The message already names the URL in prose because it has to read correctly on
+ * its own, but prose is not clickable and not copyable, and a user whose clip is sitting on
+ * Streamable right now should not have to retype it out of a paragraph.
+ *
+ * Renders nothing at all when there is no URL, which is every other skip and failure.
+ */
+function UploadedLink({ url }: { readonly url: string | undefined }): ReactElement | null {
+  if (url === undefined || url === '') return null
+  return (
+    <>
+      {/* `target="_blank"` for the same reason as the `done` row - see the note there. */}
+      <a className="clip__link" href={url} target="_blank" rel="noreferrer">
+        {url}
+      </a>
+      <CopyButton text={url} label="Copy link" srLabel="Streamable link" />
+    </>
+  )
+}
+
 function ClipRow({ clip }: { readonly clip: ClipRecord }): ReactElement {
   const placed = clip.moved && clip.finalPath !== null
   const location = clip.finalPath ?? clip.originalPath
@@ -93,6 +246,8 @@ function ClipRow({ clip }: { readonly clip: ClipRecord }): ReactElement {
       {clip.note !== null && clip.note !== '' && (
         <p className={placed ? 'clip__note' : 'clip__note clip__note--problem'}>{clip.note}</p>
       )}
+
+      <UploadState upload={clip.upload} />
     </li>
   )
 }

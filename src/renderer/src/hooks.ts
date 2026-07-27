@@ -37,7 +37,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import type { ActiveCharacter, PoeEvent, WatcherStatus } from '../../shared/events'
-import type { ClipRecord, ObsConnectionState, PoeToolApi, UpdateState } from '../../shared/ipc'
+import type {
+  ClipRecord,
+  ClipUploadUpdate,
+  CredentialsStatusResult,
+  ObsConnectionState,
+  PoeToolApi,
+  UpdateState
+} from '../../shared/ipc'
 import type { AppSettings, DeepPartial } from '../../shared/settings'
 import { applySettingsPatch } from '../../shared/settings'
 import {
@@ -157,9 +164,51 @@ function eventIdentity(event: PoeEvent): string {
   return `${event.detectedAt}|${event.meta.clientMs}|${event.type}|${event.meta.raw}`
 }
 
-/** OBS writes one file per save, so the source path plus the save time is unique. */
+/**
+ * Identity of a clip: its id, minted in main.
+ *
+ * NOT `savedAt|originalPath` any more, and the difference is not cosmetic. `ClipRecord.id`
+ * is the address `push:clip-upload` updates are sent to, so the value this feed
+ * de-duplicates on and the value an update is matched against have to be the SAME field -
+ * otherwise a clip could arrive twice under one identity while its upload updates chase
+ * the other, and the second copy would sit at "queued" forever. The id is also stable
+ * across a record being rewritten (an upload state folded in, a note added), which the
+ * path-and-time pair was only by luck: a clip that failed to move keeps the OBS path it
+ * shares with nothing else purely by accident, and a remote-OBS clip never had a local
+ * path at all.
+ */
 function clipIdentity(clip: ClipRecord): string {
-  return `${clip.savedAt}|${clip.originalPath}`
+  return clip.id
+}
+
+/**
+ * Applies one `push:clip-upload` update to a clip feed, in place.
+ *
+ * Returns `prev` BY REFERENCE when the update names a clip that is not on screen, or
+ * carries a state the row already has, so a redundant push cannot re-render the list.
+ *
+ * AN UNKNOWN `clipId` IS NORMAL, NOT AN ERROR - the clip may have aged out of the feed,
+ * or been saved before this window opened. Main outlives every window; dropping the
+ * update silently is the documented behaviour, and the row's own `upload` field is
+ * current anyway when it does arrive, because main keeps the `clips:recent` snapshot up
+ * to date.
+ */
+function applyUploadUpdate(
+  prev: readonly FeedItem<ClipRecord>[],
+  update: ClipUploadUpdate
+): readonly FeedItem<ClipRecord>[] {
+  let changed = false
+
+  const next = prev.map((item) => {
+    if (item.value.id !== update.clipId) return item
+    if (item.value.upload === update.upload) return item
+    changed = true
+    // The key is preserved deliberately: this is the same row, so React must not remount
+    // it. Only `upload` moves.
+    return { key: item.key, value: { ...item.value, upload: update.upload } }
+  })
+
+  return changed ? next : prev
 }
 
 // ---------------------------------------------------------------------------
@@ -459,16 +508,36 @@ export function useEventFeed(api: PoeToolApi, limit: number): readonly FeedItem<
   return items
 }
 
-/** The last `limit` clips, newest first. `clips:recent` is already newest-first. */
+/**
+ * The last `limit` clips, newest first, WITH THEIR UPLOAD STATE KEPT LIVE.
+ *
+ * `clips:recent` is already newest-first.
+ *
+ * TWO SUBSCRIPTIONS, ONE FEED. A clip arrives once on `push:clip` and then changes
+ * repeatedly on `push:clip-upload` as its upload is queued, sent, transcoded and either
+ * finished or lost. Merging both here rather than tracking upload state in a separate map
+ * next to the list is what keeps a row and its upload state from ever disagreeing - and
+ * `ClipRecord.upload` is documented as a SNAPSHOT taken when the record was sent, so a
+ * component reading only that field would show every upload as permanently pending.
+ *
+ * Both subscriptions are detached in the cleanup. Missing either one would leave a
+ * StrictMode double-mount (or any reload) with an orphaned listener writing into dead
+ * state.
+ */
 export function useClipFeed(api: PoeToolApi, limit: number): readonly FeedItem<ClipRecord>[] {
   const [items, setItems] = useState<readonly FeedItem<ClipRecord>[]>([])
 
   useEffect(() => {
     let active = true
 
-    const unsubscribe = api.onClip((clip) => {
+    const unsubscribeClip = api.onClip((clip) => {
       if (!active) return
       setItems((prev) => mergeFeed(prev, [clip], clipIdentity, 'c', limit, 'newer'))
+    })
+
+    const unsubscribeUpload = api.onClipUpload((update) => {
+      if (!active) return
+      setItems((prev) => applyUploadUpdate(prev, update))
     })
 
     void api.getRecentClips().then(
@@ -483,11 +552,77 @@ export function useClipFeed(api: PoeToolApi, limit: number): readonly FeedItem<C
 
     return () => {
       active = false
-      unsubscribe()
+      unsubscribeClip()
+      unsubscribeUpload()
     }
   }, [api, limit])
 
   return items
+}
+
+// ---------------------------------------------------------------------------
+// Stored credentials
+// ---------------------------------------------------------------------------
+
+/** What {@link useCredentialStatus} returns. */
+export interface CredentialStatusView {
+  /** Main's answer, or `null` until the first one arrives (or if asking failed). */
+  readonly status: CredentialsStatusResult | null
+  /** Message from a failed `credentials:status`. */
+  readonly error: string | null
+  /** Ask again. Use after anything that may have written or replaced a stored secret. */
+  readonly refresh: () => void
+}
+
+/**
+ * Whether each stored password is present and usable - and if it is not, why.
+ *
+ * THE ONLY WAY THIS WINDOW CAN KNOW. `settings.streamable.password` is `''` here at all
+ * times, because main blanks it on the way out; that says nothing about whether one is
+ * stored. Without this channel a user whose DPAPI-encrypted password can no longer be
+ * decrypted (settings copied from another machine, Windows rotated its key) sees an empty
+ * field, retypes nothing, and never finds out why their uploads stopped.
+ *
+ * FETCHED ON DEMAND, NOT LIVE, and deliberately so: there is no push channel for it and
+ * there should not be, because the value only changes as a direct result of something the
+ * user just did in this window. {@link CredentialStatusView.refresh} is how the caller
+ * says "I have just saved a password" or "I have just tested one".
+ *
+ * A failed fetch leaves `status` at its previous value rather than blanking it - a
+ * transient IPC failure should not make the UI claim a stored password has vanished.
+ */
+export function useCredentialStatus(api: PoeToolApi): CredentialStatusView {
+  const [status, setStatus] = useState<CredentialsStatusResult | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [token, setToken] = useState(0)
+
+  useEffect(() => {
+    let active = true
+
+    void api.getCredentialStatus().then(
+      (next) => {
+        if (!active) return
+        setStatus(next)
+        setError(null)
+      },
+      (fetchError: unknown) => {
+        if (!active) return
+        setError(describeError(fetchError))
+      }
+    )
+
+    // `active` drops the response of a request that a `refresh` (or a StrictMode
+    // double-mount) has already superseded, so a slow answer cannot overwrite a fresh one.
+    return () => {
+      active = false
+    }
+  }, [api, token])
+
+  const refresh = useCallback((): void => {
+    setToken((current) => current + 1)
+  }, [])
+
+  return { status, error, refresh }
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +645,19 @@ export const SETTINGS_DEBOUNCE_MS = 350
  * fields that change BEHIND the renderer's back, when a level-up lands in main, and this
  * comparison is what decides whether the reply to a save is adopted into local state.
  * Leaving them out would pin a stale detection in the UI until the next reload.
+ *
+ * `streamable.password` IS COMPARED FOR THE OPPOSITE REASON, and it is the one entry here
+ * that is expected to differ on a normal round-trip. The user types a password, local
+ * state holds it, main saves it and replies with `''` (every `AppSettings` leaving main
+ * has its secrets blanked). That difference MUST be seen, so that the reply is adopted
+ * and this window goes back to holding a blank - which is what makes the next patch it
+ * sends mean "leave the stored password alone" rather than "here it is again". A missing
+ * comparison here would leave the plaintext sitting in renderer state for the lifetime of
+ * the window, which is exactly what the redaction exists to prevent.
+ *
+ * Every other `streamable` field is compared for the ordinary reason: without them a
+ * toggle click would compare equal, `applyLocal` would report "nothing changed", and the
+ * control would appear not to work at all.
  */
 function sameSettings(a: AppSettings | null, b: AppSettings): boolean {
   if (a === null) return false
@@ -527,7 +675,12 @@ function sameSettings(a: AppSettings | null, b: AppSettings): boolean {
     a.clips.enabled === b.clips.enabled &&
     a.clips.libraryDir === b.clips.libraryDir &&
     a.clips.debounceMs === b.clips.debounceMs &&
-    a.clips.writeSidecar === b.clips.writeSidecar
+    a.clips.writeSidecar === b.clips.writeSidecar &&
+    a.streamable.enabled === b.streamable.enabled &&
+    a.streamable.email === b.streamable.email &&
+    a.streamable.password === b.streamable.password &&
+    a.streamable.autoUpload === b.streamable.autoUpload &&
+    a.streamable.maxFileBytes === b.streamable.maxFileBytes
   )
 }
 

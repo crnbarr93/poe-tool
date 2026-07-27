@@ -56,6 +56,43 @@
  * take down log tailing the moment the user closed the window. {@link makeSender}
  * checks `isDestroyed()` on both the window and its webContents AND wraps the send,
  * because the window can be torn down between the check and the call.
+ *
+ *
+ * A PASSWORD TRAVELS RENDERER -> MAIN, NEVER MAIN -> RENDERER
+ * -----------------------------------------------------------
+ * THE INVARIANT, in full: the Streamable credential is an ACCOUNT email + password
+ * (Streamable has no revocable upload token), this repository is PUBLIC, and the
+ * renderer is a real web page - anything that reaches it reaches devtools and any
+ * script that ends up running there. So a password crosses this boundary in exactly one
+ * direction, and only because the user has just typed it: `settings:set` and
+ * `streamable:test` carry one IN. Nothing carries one OUT. Not a result, not a push, not
+ * an error message, not a diagnostic string.
+ *
+ * THREE MECHANISMS ENFORCE IT HERE, and all three are load-bearing:
+ *
+ *  1. EVERY `AppSettings` LEAVING THIS FILE GOES THROUGH `redactSecrets`. Both
+ *     `settings:get` and `settings:set` resolve with one, so without it every settings
+ *     round-trip would ship the account password into the window. The helper lives in
+ *     `src/shared/settings.ts` so the rule is one greppable function; the only thing
+ *     this file has to get right is calling it on EVERY return path, including the
+ *     failure path of `settings:set`.
+ *  2. THE RENDERER THEREFORE HOLDS `''`, and `useSettingsController` echoes its whole
+ *     settings object back as a patch - so an EMPTY `streamable.password` in an incoming
+ *     patch must mean "leave the stored one alone", never "clear it". That is
+ *     {@link optionalSecret}, and it is the same class of rule as `character.detected*`
+ *     being unwriteable: main's copy wins because the renderer's is knowingly
+ *     incomplete. The cost is that an empty field cannot express "forget my password";
+ *     the frozen contract accepts that trade rather than risk wiping a credential every
+ *     time the user edits an unrelated field.
+ *  3. WHETHER A PASSWORD EXISTS IS ANSWERED SEPARATELY, by `credentials:status`, which
+ *     reports facts ABOUT a secret and never the secret. `''` from `settings:get` says
+ *     nothing either way, deliberately.
+ *
+ * And the corollary for failure text: {@link StreamableTestFailure.error} describes the
+ * ATTEMPT. The one place an unrecognised value could smuggle a credential back out is a
+ * message built from a thrown error, so the `streamable:test` crash path deliberately
+ * discards the thrown detail and reports a fixed sentence, logging the original through
+ * {@link IpcHandlerDeps.onError} where it stays inside the main process.
  */
 
 import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron'
@@ -65,6 +102,8 @@ import {
   IPC_INVOKE,
   IPC_PUSH,
   type ClipRecord,
+  type ClipUploadUpdate,
+  type CredentialsStatusResult,
   type IpcInvokeChannel,
   type IpcInvokeResult,
   type IpcPushChannel,
@@ -72,10 +111,17 @@ import {
   type ObsConnectionState,
   type ObsTestRequest,
   type ObsTestResult,
+  type StreamableTestRequest,
+  type StreamableTestResult,
   type UpdateState
 } from '../shared/ipc'
-import type { AppSettings, DeepPartial, ObsSettings } from '../shared/settings'
-import { PORT_MAX, PORT_MIN } from '../shared/settings'
+import type {
+  AppSettings,
+  DeepPartial,
+  ObsSettings,
+  StreamableSettings
+} from '../shared/settings'
+import { PORT_MAX, PORT_MIN, redactSecrets } from '../shared/settings'
 // A pure static, NOT a service: `CharacterTracker.suggestionsFrom` takes events and
 // returns names, touching no bus, no settings and no instance state. Importing it is
 // therefore not a violation of the ports doctrine above - the alternative, re-implementing
@@ -130,6 +176,58 @@ const NO_CHARACTER: ActiveCharacter = Object.freeze({
   level: null,
   source: 'none'
 })
+
+/**
+ * The `credentials:status` answer when the store could not be asked.
+ *
+ * {@link CredentialsPort.status} is documented as never throwing, so this is the belt to
+ * that braces - but the choice of value still matters, because all three
+ * {@link CredentialStatus} values are ASSERTIONS the UI puts in front of the user:
+ *
+ *  - `'ok'` would claim the secret is fine when we have just failed to establish
+ *    anything at all. That is the one answer that could leave a user believing uploads
+ *    are configured while they silently are not.
+ *  - `'undecryptable'` would tell them their saved password is gone and must be retyped.
+ *    Instructing a user to redo work on the strength of an internal fault is worse than
+ *    saying less.
+ *  - `'unavailable'` says "poe-tool cannot vouch for a stored secret right now", which is
+ *    exactly what a store that would not answer has told us. It warns without inventing
+ *    a cause and without asking for anything to be redone.
+ *
+ * `present: false` for the same reason: we cannot see a usable secret, so claiming one is
+ * held would be a guess. Frozen because it is handed out by reference.
+ */
+const CREDENTIALS_UNKNOWN: CredentialsStatusResult = Object.freeze({
+  obs: Object.freeze({ status: 'unavailable', present: false }),
+  streamable: Object.freeze({ status: 'unavailable', present: false })
+})
+
+/**
+ * What `streamable:test` reports when the credential check THREW instead of resolving.
+ *
+ * FIXED TEXT, ON PURPOSE - it is the one string in this file that could otherwise be
+ * built out of a value nobody has inspected. {@link StreamablePort.testCredentials} is
+ * documented as never rejecting and never quoting the credential it was handed, so
+ * reaching here at all means an assumption broke; and an unrecognised thrown value is
+ * precisely the kind of thing that might carry an `Authorization` header or a request
+ * dump inside its message. The original goes to {@link IpcHandlerDeps.onError}, where it
+ * stays inside the main process. See the password invariant in this file's header.
+ */
+const STREAMABLE_TEST_CRASH =
+  'Could not check your Streamable credentials — the check itself failed unexpectedly. ' +
+  'Try again; if it keeps happening, uploading is probably broken rather than your password.'
+
+/**
+ * What `streamable:test` reports when uploading is switched off.
+ *
+ * `settings.streamable.enabled` is documented as a MASTER SWITCH: with it off, poe-tool
+ * never contacts Streamable at all - "no upload, no status poll, no credential check".
+ * Enforcing that at the IPC boundary rather than only in the UI is what makes it true: a
+ * renderer is untrusted, and "we never talk to that third party unless you turned it on"
+ * is a promise about network traffic, not a button state.
+ */
+const STREAMABLE_TEST_DISABLED =
+  'Streamable uploading is turned off, so nothing was sent. Turn it on first, then test.'
 
 // ---------------------------------------------------------------------------
 // Dependency ports
@@ -265,6 +363,81 @@ export interface ClipperPort {
 }
 
 /**
+ * What this file needs from the ONE module allowed to talk to Streamable: a credential
+ * check that uploads nothing.
+ *
+ * DELIBERATELY ONE METHOD. How a credential is verified against a service whose upload
+ * endpoint is UNOFFICIAL and whose documented API is read-only is that module's problem,
+ * and keeping every assumption about it in one file is the entire point of the design -
+ * see its header. This port is the seam, so nothing about that endpoint leaks in here.
+ *
+ * CONTRACT:
+ *  - NEVER REJECTS. A wrong password is the expected outcome of pressing "Test
+ *    credentials", not an exception (mirroring {@link ObsPort.testConnection}).
+ *  - {@link StreamableTestFailure.error} is safe to render verbatim and MUST NOT quote the
+ *    password it was handed. See the password invariant in this file's header.
+ */
+export interface StreamablePort {
+  readonly testCredentials: (request: StreamableTestRequest) => Promise<StreamableTestResult>
+}
+
+/**
+ * What this file needs from the clip upload queue: per-clip progress, and a poke when the
+ * settings it runs on have moved.
+ *
+ * A SECOND EMITTER, NOT A BUS CHANNEL, for the same reason {@link ClipperPort} is: an
+ * upload update happens far downstream of anything the log parser produced, and
+ * `PoeEventMap` describes log-derived events.
+ *
+ * The updates are addressed by {@link ClipRecord.id} rather than carrying a whole record -
+ * see {@link ClipUploadUpdate} - so one row in the UI changes in place.
+ */
+export interface UploadPort {
+  /**
+   * Re-read the settings store and adopt anything that moved: the master switch, the
+   * account credentials, the auto-upload flag, the size cap.
+   *
+   * CALLED UNCONDITIONALLY after every successful `settings:set`, exactly like
+   * {@link WatcherPort.reconfigure}, so the CONTRACT is that the implementation compares
+   * first and no-ops otherwise. The comparison belongs on that side: the queue is the
+   * thing that knows whether a changed field means "rebuild the client" (email,
+   * password), "stop accepting new clips" (enabled, autoUpload) or "nothing at all"
+   * (a size cap that only matters at the next admission). Duplicating that knowledge here
+   * would let the two drift, and this handler must not be the thing that decides an
+   * in-flight upload is worth cancelling.
+   *
+   * Takes no arguments BECAUSE OF THE PASSWORD INVARIANT as much as for symmetry with the
+   * watcher: the queue already holds the same settings store this handler just wrote to,
+   * so the new credential reaches it without being passed through another hop - and it is
+   * one hop the plaintext therefore never travels along.
+   */
+  readonly reconfigure: () => void | Promise<void>
+  readonly on: (channel: 'upload', listener: (update: ClipUploadUpdate) => void) => unknown
+  readonly off: (channel: 'upload', listener: (update: ClipUploadUpdate) => void) => unknown
+}
+
+/**
+ * What this file needs from whoever owns encryption at rest - in practice
+ * `src/main/settings/store.ts`, adapted by index.ts.
+ *
+ * THE COMPANION TO REDACTION. Because every `AppSettings` leaving this file has its
+ * secrets blanked, the renderer cannot tell "no password saved" from "a password is
+ * saved and you are holding a redacted blank", and it cannot tell either of those from
+ * "an encrypted blob is on disk that this machine can no longer decrypt". That last state
+ * is the one that matters: without it the field simply looks empty and the user is left
+ * to work out for themselves why uploads stopped. So the question is answered by a
+ * channel that returns FACTS ABOUT a secret and never a secret.
+ *
+ * Documented as never throwing, cheap (it reports what the store already knows rather
+ * than probing the OS), and reporting BOTH slots - a DPAPI failure hits them together,
+ * and a UI that explained one while silently dropping the other is how a user ends up
+ * believing OBS is misconfigured.
+ */
+export interface CredentialsPort {
+  readonly status: () => CredentialsStatusResult
+}
+
+/**
  * What this file needs from `src/main/updater.ts`. `AppUpdater` satisfies it as-is -
  * `state` is a getter and `on`/`off` mirror `TypedEmitter`, exactly like {@link ObsPort}.
  *
@@ -289,6 +462,20 @@ export interface IpcHandlerDeps {
   readonly watcher: WatcherPort
   readonly characters: CharacterPort
   readonly updater: UpdaterPort
+  /**
+   * The Streamable client, for `streamable:test`.
+   *
+   * REQUIRED, like every other port here, even though uploading defaults to OFF. An
+   * optional dependency would mean a build that forgot to wire it answered "credentials
+   * rejected" or "not available" to a user whose credentials are fine - a silent
+   * misconfiguration of exactly the kind this app refuses to ship. Missing it is a
+   * compile error in index.ts instead.
+   */
+  readonly streamable: StreamablePort
+  /** The clip upload queue: the source of `push:clip-upload`, and a reconfigure target. */
+  readonly uploads: UploadPort
+  /** Whether each stored secret is present and usable. Never returns a secret. */
+  readonly credentials: CredentialsPort
   /**
    * The window to push to, or null/undefined when there is none.
    *
@@ -355,6 +542,32 @@ function optionalNumber(value: unknown): number | undefined {
   return undefined
 }
 
+/**
+ * A SECRET from a patch: a non-empty string, or `undefined` for everything else -
+ * INCLUDING `''`.
+ *
+ * This is the second half of the redaction rule, and the half that is easy to miss. The
+ * renderer is handed `streamable.password: ''` by `redactSecrets` and echoes its whole
+ * settings object back as a patch on every edit, so if `''` were treated as a value, then
+ * changing the clip folder - or toggling auto-upload, or typing in the log path - would
+ * wipe the user's stored Streamable password. It would look like the app forgetting a
+ * credential at random, which is precisely how a user learns to distrust an app.
+ *
+ * `applySettingsPatch` deliberately does NOT know this rule (see its own note): there,
+ * "absent means no change" is the only patch semantic, so that a deliberate clear stays
+ * expressible in-process. Dropping the empty string is this file's job, at the trust
+ * boundary, where "the renderer's copy is knowingly incomplete" is the reason.
+ *
+ * THE ACCEPTED COST: with `''` meaning "no change", the config window has no way to say
+ * "forget the password I stored". Replacing it by typing a new one works; emptying the
+ * field does not. The frozen contract chose that over a credential that vanishes whenever
+ * an unrelated field is saved.
+ */
+function optionalSecret(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  return value === '' ? undefined : value
+}
+
 /** A boolean, or the strings `"true"`/`"false"` (checkbox round-trips), else `undefined`. */
 function optionalBoolean(value: unknown): boolean | undefined {
   if (typeof value === 'boolean') return value
@@ -369,11 +582,19 @@ function optionalBoolean(value: unknown): boolean | undefined {
 /**
  * Rebuilds an arbitrary renderer payload as a well-typed {@link DeepPartial} patch.
  *
- * Only the ten known fields survive; everything else - extra keys, prototype pollution
- * attempts, functions, nested junk - is dropped on the floor. A field whose value has
- * the wrong type becomes `undefined`, which `applySettingsPatch` reads as "no change"
- * rather than "reset to default", so a garbled patch can never silently wipe a setting
- * the user did not touch.
+ * Only the fifteen known fields survive; everything else - extra keys, prototype
+ * pollution attempts, functions, nested junk - is dropped on the floor. A field whose
+ * value has the wrong type becomes `undefined`, which `applySettingsPatch` reads as "no
+ * change" rather than "reset to default", so a garbled patch can never silently wipe a
+ * setting the user did not touch.
+ *
+ * `streamable.password` GETS ITS OWN NARROWER
+ * -------------------------------------------
+ * It is read with {@link optionalSecret} rather than {@link optionalString}, so an empty
+ * string is dropped as "no change" instead of clearing the stored credential. That is not
+ * a nicety: the renderer holds a redacted `''` for this field at all times and sends its
+ * whole settings object back on every edit. See {@link optionalSecret} for the full
+ * reasoning, and this file's header for the invariant it belongs to.
  *
  * `character.override` IS THE ONLY WRITEABLE HALF OF `character`
  * -------------------------------------------------------------
@@ -402,6 +623,7 @@ export function narrowSettingsPatch(raw: unknown): DeepPartial<AppSettings> {
   const character = field(raw, 'character')
   const obs = field(raw, 'obs')
   const clips = field(raw, 'clips')
+  const streamable = field(raw, 'streamable')
 
   return {
     log: {
@@ -422,6 +644,14 @@ export function narrowSettingsPatch(raw: unknown): DeepPartial<AppSettings> {
       libraryDir: optionalString(field(clips, 'libraryDir')),
       debounceMs: optionalNumber(field(clips, 'debounceMs')),
       writeSidecar: optionalBoolean(field(clips, 'writeSidecar'))
+    },
+    streamable: {
+      enabled: optionalBoolean(field(streamable, 'enabled')),
+      email: optionalString(field(streamable, 'email')),
+      // NOT `optionalString`. An empty password means "leave the stored one alone".
+      password: optionalSecret(field(streamable, 'password')),
+      autoUpload: optionalBoolean(field(streamable, 'autoUpload')),
+      maxFileBytes: optionalNumber(field(streamable, 'maxFileBytes'))
     }
   }
 }
@@ -450,6 +680,40 @@ export function narrowObsTestRequest(raw: unknown, fallback: ObsSettings): ObsTe
     host: optionalString(field(raw, 'host')) ?? fallback.host,
     port: optionalPort(field(raw, 'port')) ?? fallback.port,
     password: optionalString(field(raw, 'password')) ?? fallback.password
+  }
+}
+
+/**
+ * Rebuilds a `streamable:test` payload, substituting the SAVED credential for anything
+ * the renderer omitted, sent as the wrong type, or sent as blank.
+ *
+ * THE BLANK PASSWORD CASE IS THE NORMAL ONE, and it is why this cannot just be
+ * {@link narrowObsTestRequest} with different field names. The renderer's copy of
+ * `streamable.password` is `''` at all times - `redactSecrets` blanked it - so a user who
+ * saved a password last week, reopened the window and pressed "Test credentials" is
+ * sending an empty string. Testing that empty string would report "Streamable rejected
+ * your credentials" about a password that is perfectly good, and send the user off to
+ * change a password that was never wrong. Falling back to the stored value tests what the
+ * uploader will actually use, which is the only question the button is asking.
+ *
+ * The email falls back for the ordinary reason its OBS counterpart does: "test what is
+ * currently configured" is a useful answer, and a complaint about a malformed payload is
+ * not.
+ *
+ * NOTHING IN THE RESULT TRAVELS BACK. The password put in here is used to build an HTTP
+ * Basic header inside the Streamable module and is never part of a
+ * {@link StreamableTestResult}.
+ *
+ * PURE and TOTAL: never throws.
+ */
+export function narrowStreamableTestRequest(
+  raw: unknown,
+  fallback: StreamableSettings
+): StreamableTestRequest {
+  const typed = optionalString(field(raw, 'email'))
+  return {
+    email: typed === undefined || typed.trim() === '' ? fallback.email : typed.trim(),
+    password: optionalSecret(field(raw, 'password')) ?? fallback.password
   }
 }
 
@@ -508,7 +772,10 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
     registered.push(channel)
   }
 
-  register(IPC_INVOKE.SETTINGS_GET, () => deps.settings.get())
+  // `redactSecrets` on EVERY return path out of both settings channels - see the password
+  // invariant in this file's header. It returns its argument by reference when there is
+  // nothing to blank, so the common case allocates nothing.
+  register(IPC_INVOKE.SETTINGS_GET, () => redactSecrets(deps.settings.get()))
 
   register(IPC_INVOKE.SETTINGS_SET, (_event, ...args) => {
     const previous = deps.settings.get()
@@ -524,11 +791,11 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
       // actually in effect, and the user sees their edit revert instead of believing
       // a change took hold that did not.
       report(error, 'settings:set/save')
-      return deps.settings.get()
+      return redactSecrets(deps.settings.get())
     }
 
     reconfigure(deps, previous, next, report)
-    return next
+    return redactSecrets(next)
   })
 
   register(IPC_INVOKE.OBS_TEST, async (_event, ...args) => {
@@ -544,6 +811,52 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   })
 
   register(IPC_INVOKE.OBS_STATUS, () => deps.obs.state)
+
+  register(IPC_INVOKE.STREAMABLE_TEST, async (_event, ...args) => {
+    const settings = deps.settings.get().streamable
+
+    // The master switch is enforced BEFORE the request is even assembled, so with
+    // uploading off there is no code path from this channel to the network. See
+    // {@link STREAMABLE_TEST_DISABLED}.
+    if (!settings.enabled) return { ok: false, error: STREAMABLE_TEST_DISABLED }
+
+    const request = narrowStreamableTestRequest(args[0], settings)
+
+    // Answering "you have not entered an email yet" here rather than letting Streamable
+    // answer it: an HTTP round trip to say what we can see locally is both slower and
+    // vaguer, and the vaguer version ("401") reads like a rejected password.
+    if (request.email === '') {
+      return {
+        ok: false,
+        error: 'No Streamable account email is set. Enter the email you sign in with, then test.'
+      }
+    }
+    if (request.password === '') {
+      return {
+        ok: false,
+        error: 'No Streamable password is stored. Type your account password, then test.'
+      }
+    }
+
+    try {
+      return await deps.streamable.testCredentials(request)
+    } catch (error) {
+      // `testCredentials` is documented as never rejecting; this is the belt to that
+      // braces. The thrown value is reported to main's log and DELIBERATELY NOT
+      // rendered - see {@link STREAMABLE_TEST_CRASH}.
+      report(error, 'streamable:test')
+      return { ok: false, error: STREAMABLE_TEST_CRASH }
+    }
+  })
+
+  register(IPC_INVOKE.CREDENTIALS_STATUS, () => {
+    try {
+      return deps.credentials.status()
+    } catch (error) {
+      report(error, 'credentials:status')
+      return CREDENTIALS_UNKNOWN
+    }
+  })
 
   register(IPC_INVOKE.LOG_AUTODETECT, async () => {
     try {
@@ -625,7 +938,7 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   // Push channels
   // -------------------------------------------------------------------------
 
-  // These five run inside the emitters they subscribe to, on the critical path.
+  // Every one of these runs inside the emitter it subscribes to, on the critical path.
   // Nothing in them may throw: `send` swallows, and the ring-buffer writes cannot
   // fail.
 
@@ -655,6 +968,44 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
       recentClips.length = RECENT_CLIPS_LIMIT
     }
     send(IPC_PUSH.CLIP, clip)
+  }
+
+  /**
+   * One clip's upload state moved.
+   *
+   * TWO JOBS, AND THE SECOND ONE IS THE ONE THAT IS EASY TO FORGET.
+   *
+   *  1. Push the update at whatever window exists, addressed by clip id so the UI
+   *     changes one row in place.
+   *  2. FOLD IT BACK INTO THE RING BUFFER. `ClipRecord.upload` is documented as a
+   *     snapshot "at the moment this record was sent" - and for `clips:recent` that
+   *     moment is whenever a window next asks. A buffer holding the record as it was at
+   *     save time would answer `pending` for every clip forever, so a window opened after
+   *     an upload finished (or reloaded, or re-created from the tray - all ordinary, since
+   *     main outlives every window) would show a feed of stalled uploads and no links.
+   *     Rewriting the one field keeps the snapshot true without inventing a second
+   *     source of truth: the queue still owns the state, this is just where the answer to
+   *     `clips:recent` is kept current.
+   *
+   * An id that is not in the buffer is NORMAL - the clip may have aged out past
+   * {@link RECENT_CLIPS_LIMIT}, or been saved before this registration existed. The push
+   * still goes out; the renderer drops unknown ids by contract.
+   *
+   * Runs inside the queue's emitter, so nothing here may throw: the array write cannot
+   * fail and `send` swallows.
+   */
+  const onUploadUpdate = (update: ClipUploadUpdate): void => {
+    if (disposed) return
+
+    const index = recentClips.findIndex((clip) => clip.id === update.clipId)
+    if (index !== -1) {
+      const existing = recentClips[index]
+      // `noUncheckedIndexedAccess` - the index came from `findIndex` on this same array
+      // one statement ago, so this cannot be undefined, but the check costs nothing.
+      if (existing !== undefined) recentClips[index] = { ...existing, upload: update.upload }
+    }
+
+    send(IPC_PUSH.CLIP_UPLOAD, update)
   }
 
   /**
@@ -703,6 +1054,7 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   deps.bus.on('character-changed', onCharacterChanged)
   deps.obs.on('state', onObsState)
   deps.clipper.on('clip', onClipSaved)
+  deps.uploads.on('upload', onUploadUpdate)
   deps.updater.on('state', onUpdateState)
 
   // -------------------------------------------------------------------------
@@ -740,6 +1092,15 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
       deps.clipper.off('clip', onClipSaved)
     } catch (error) {
       report(error, 'teardown:clipper')
+    }
+
+    // Detached in its own try/catch like every other subscription: an upload in flight
+    // outlives the window it was being reported to, and its next state change must not
+    // reach a `webContents.send` for a window that is being destroyed.
+    try {
+      deps.uploads.off('upload', onUploadUpdate)
+    } catch (error) {
+      report(error, 'teardown:uploads')
     }
 
     try {
@@ -821,6 +1182,31 @@ function reconfigure(
     // A synchronous throw from a `void`-returning implementation never reaches the
     // `.catch` above, so it needs its own guard.
     report(error, 'reconfigure:watcher')
+  }
+
+  // The upload queue, on the same unconditional terms as the watcher - it compares and
+  // no-ops, see {@link UploadPort.reconfigure}.
+  //
+  // THIS CALL IS THE ONLY THING THAT MAKES A CREDENTIAL EDIT TAKE EFFECT. The queue and
+  // the Streamable client read the settings store, but nothing tells them it moved: a
+  // user who fixes a wrong password would otherwise keep failing every upload with the
+  // old one until they restarted the app, with the config window showing the new value
+  // the whole time. Note that no credential is passed HERE - the queue re-reads the store
+  // it already holds, which is both simpler and one hop the plaintext never travels.
+  //
+  // Deliberately NOT gated on a `previous.streamable` vs `next.streamable` diff. Main
+  // holds both plaintexts and could compare them, but doing so would be this file
+  // guessing at the queue's business: whether a changed size cap, a paused auto-upload or
+  // a re-typed identical password is worth rebuilding a client - or cancelling an upload
+  // already in flight - is knowledge that belongs on that side, exactly as the watcher's
+  // restart rules belong on its. A redundant no-op poke costs nothing next to an upload
+  // that silently keeps using a stale credential.
+  try {
+    void Promise.resolve(deps.uploads.reconfigure()).catch((error: unknown) => {
+      report(error, 'reconfigure:uploads')
+    })
+  } catch (error) {
+    report(error, 'reconfigure:uploads')
   }
 
   const connectionChanged =

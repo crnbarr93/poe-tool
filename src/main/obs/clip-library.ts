@@ -39,13 +39,14 @@
  *    `originalPath`" - it never means "no clip".
  */
 
+import { randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
 import { mkdir, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import * as path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 
 import type { CurrentZone, DeathCause } from '../../shared/events'
-import type { ClipRecord } from '../../shared/ipc'
+import type { ClipRecord, UploadOutcome } from '../../shared/ipc'
 import { applyCollisionSuffix, buildClipBasename, extensionFromPath } from './clip-namer'
 
 // ---------------------------------------------------------------------------
@@ -250,6 +251,40 @@ export interface ClipSidecar {
   readonly finalPath: string
 }
 
+/**
+ * Mints the opaque, stable {@link ClipRecord.id} a clip is addressed by for the rest of
+ * its life - specifically by `push:clip-upload`, which updates one row of the UI in
+ * place (see {@link ClipRecord.id} for why nothing derived from the path, the timestamp
+ * or the two together would do).
+ *
+ * `randomUUID` rather than a counter because there are two minting sites - here and the
+ * synthesised record in `./replay-clipper.ts`, for the case where this class itself
+ * throws - and a counter shared between them would need state that survives both. There
+ * is no security property being claimed; uniqueness within a session is the whole
+ * requirement, and `randomUUID` clears it without a shared variable.
+ *
+ * Exported so that second site can use the same function instead of inventing a second
+ * id format. PURE except for the randomness; never throws.
+ */
+export function newClipId(): string {
+  return randomUUID()
+}
+
+/**
+ * The upload state a clip is BORN with, before anything has looked at it.
+ *
+ * `disabled` - "no upload is happening" - rather than `pending`, because `pending`
+ * promises an attempt that has not been decided on yet: uploading is off by default
+ * (`streamable.enabled` defaults to false), and a record that claimed `pending` on a
+ * machine with no Streamable account would be a promise the app never keeps.
+ *
+ * It is corrected within the same tick when uploads ARE on: `UploadQueue.handleClip`
+ * runs synchronously inside the same `clip` emit and publishes `pending` immediately.
+ * See `ClipRecord.upload` - this field is a snapshot, and everything after it arrives on
+ * `push:clip-upload`.
+ */
+const INITIAL_UPLOAD: UploadOutcome = Object.freeze({ state: 'disabled' })
+
 /** The `ClipRecord` fields that are known before the move is even attempted. */
 type ClipRecordCore = Omit<ClipRecord, 'moved' | 'finalPath' | 'note'>
 
@@ -362,6 +397,12 @@ export class ClipLibrary {
   #core(opts: MoveClipOptions): ClipRecordCore {
     const stamp = opts.when.getTime()
     return {
+      // Minted HERE, in `#core`, so that every record this class can return - the
+      // remote-OBS refusal, the unconfigured-directory refusal, the failed move and the
+      // successful one - carries exactly one id, and no path through `moveClip` can
+      // produce a record the upload pipeline cannot address.
+      id: newClipId(),
+      upload: INITIAL_UPLOAD,
       // An Invalid Date would poison the sort key, so fall back to "now".
       savedAt: Number.isNaN(stamp) ? Date.now() : stamp,
       originalPath: opts.sourcePath,
