@@ -55,6 +55,7 @@ import type {
   ObsConnectionState,
   ObsTestRequest,
   ObsTestResult,
+  SessionStatsSnapshot,
   StreamableTestRequest,
   StreamableTestResult,
   UpdateState
@@ -161,12 +162,18 @@ interface Harness {
   readonly breakSettingsSave: (error: unknown) => void
   /** Make `credentials:status` throw, to exercise the fallback. */
   readonly breakCredentials: (error: unknown) => void
+  /** Make `app:version` throw, to check the window is told nothing rather than a guess. */
+  readonly breakAppVersion: (error: unknown) => void
   /** Emit a clip the way `ReplayClipper` does. */
   readonly emitClip: (clip: ClipRecord) => void
   /** Emit an upload state change the way the upload queue does. */
   readonly emitUpload: (update: ClipUploadUpdate) => void
   /** How many times `settings:set` has poked the upload queue. */
   readonly uploadReconfigures: () => number
+  /** Move the counters the way `SessionStats` does, then announce it. */
+  readonly emitStats: (snapshot: SessionStatsSnapshot) => void
+  /** Make `stats.snapshot` throw, which the port is contracted never to do. */
+  readonly breakStats: (error: unknown) => void
 }
 
 /** Both slots healthy and empty - the state of a machine nobody has configured yet. */
@@ -273,11 +280,32 @@ function makeHarness(initial: DeepPartial<AppSettings> = {}): Harness {
   // shows up as a broadcast after teardown rather than as a silent pass.
   const clipListeners = new Set<(clip: ClipRecord) => void>()
   const uploadListeners = new Set<(update: ClipUploadUpdate) => void>()
+  const statsListeners = new Set<(snapshot: SessionStatsSnapshot) => void>()
+
+  /** What `stats.snapshot` currently answers. Moved by `emitStats`. */
+  let statsSnapshot: SessionStatsSnapshot = {
+    startedAt: T0,
+    uptimeMs: 0,
+    areasEntered: 0,
+    deaths: 0,
+    suicides: 0,
+    characterLevel: null
+  }
+
+  /** Non-null makes `stats.snapshot` throw, which the port is contracted never to do. */
+  let statsThrows: { readonly error: unknown } | null = null
 
   /** Non-null makes every `save` throw, the way a read-only or full disk does. */
   let saveThrows: { readonly error: unknown } | null = null
 
+  /** Non-null makes `appVersion` throw, which the port is contracted never to do. */
+  let appVersionThrows: { readonly error: unknown } | null = null
+
   const deps: IpcHandlerDeps = {
+    appVersion: () => {
+      if (appVersionThrows !== null) throw appVersionThrows.error
+      return '0.0.0-test'
+    },
     settings: {
       get: () => settings,
       save: (patch) => {
@@ -333,6 +361,20 @@ function makeHarness(initial: DeepPartial<AppSettings> = {}): Harness {
       on: () => undefined,
       off: () => undefined
     },
+    // The COUNTING rules are `test/session-stats.test.ts`'s subject, not this file's - so
+    // the snapshot is a settable value rather than a real `SessionStats`. What IS this
+    // file's subject is the wire: that the getter is read per request rather than
+    // captured once, that a throw degrades to `null`, and that `push:stats` reaches the
+    // window and stops at teardown. A `Set` of listeners rather than a single slot, so an
+    // `off()` that removes the wrong one shows up as a broadcast after dispose.
+    stats: {
+      get snapshot(): SessionStatsSnapshot {
+        if (statsThrows !== null) throw statsThrows.error
+        return statsSnapshot
+      },
+      on: (_channel, listener) => statsListeners.add(listener),
+      off: (_channel, listener) => statsListeners.delete(listener)
+    },
     getWindow: () => window,
     onError: () => undefined
   }
@@ -366,13 +408,26 @@ function makeHarness(initial: DeepPartial<AppSettings> = {}): Harness {
     breakCredentials: (error) => {
       credentialsThrows = { error }
     },
+    breakAppVersion: (error) => {
+      appVersionThrows = { error }
+    },
     emitClip: (clip) => {
       for (const listener of clipListeners) listener(clip)
     },
     emitUpload: (update) => {
       for (const listener of uploadListeners) listener(update)
     },
-    uploadReconfigures: () => uploadReconfigureCount
+    uploadReconfigures: () => uploadReconfigureCount,
+    // Mirrors `SessionStats`: the counters move FIRST and the announcement follows, so a
+    // handler that answered `stats:session` from a stale capture would disagree with the
+    // push it just sent.
+    emitStats: (snapshot) => {
+      statsSnapshot = snapshot
+      for (const listener of statsListeners) listener(snapshot)
+    },
+    breakStats: (error) => {
+      statsThrows = { error }
+    }
   }
 
   live.push(harness)
@@ -389,6 +444,127 @@ function characterPushes(sent: readonly Sent[]): readonly ActiveCharacter[] {
   }
   return out
 }
+
+// ---------------------------------------------------------------------------
+// app:version
+// ---------------------------------------------------------------------------
+
+describe('app:version', () => {
+  it('hands the window the running build, not a number the layout was drawn with', async () => {
+    const h = makeHarness()
+
+    expect(await h.invoke(IPC_INVOKE.APP_VERSION)).toBe('0.0.0-test')
+  })
+
+  it('answers "" rather than a guess when the version cannot be read', async () => {
+    const h = makeHarness()
+    h.breakAppVersion(new Error('no app object'))
+
+    // `''` is the documented "unknown" answer and the sidebar renders no version line for
+    // it. A fallback value would send a bug report to the wrong release.
+    expect(await h.invoke(IPC_INVOKE.APP_VERSION)).toBe('')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// stats:session / push:stats
+// ---------------------------------------------------------------------------
+
+/** Only the `push:stats` payloads, in order. */
+function statsPushes(sent: readonly Sent[]): readonly SessionStatsSnapshot[] {
+  const out: SessionStatsSnapshot[] = []
+  for (const item of sent) {
+    if (item.channel !== IPC_PUSH.STATS) continue
+    // Narrowed by the channel, which the push contract pairs with this payload type.
+    out.push(item.payload as SessionStatsSnapshot)
+  }
+  return out
+}
+
+/**
+ * The session counters on the wire.
+ *
+ * The COUNTING is pinned in `test/session-stats.test.ts`. What is pinned here is the
+ * transport, and the thing that makes it worth pinning is that the Activity view's stat
+ * strip has no other source: if this channel silently answers a stale or zeroed snapshot,
+ * the window shows a confident "0 deaths" for an evening that had six, and nothing
+ * anywhere says otherwise.
+ */
+describe('stats:session', () => {
+  it('reads the counters per request rather than capturing them at registration', async () => {
+    const h = makeHarness()
+
+    expect(await h.invoke(IPC_INVOKE.STATS_SESSION)).toMatchObject({
+      areasEntered: 0,
+      deaths: 0
+    })
+
+    h.emitStats({
+      startedAt: T0,
+      uptimeMs: 60_000,
+      areasEntered: 4,
+      deaths: 2,
+      suicides: 1,
+      characterLevel: 71
+    })
+
+    // The SECOND read has to see the movement. A handler closing over the snapshot at
+    // registration time would still answer zeroes here, and a window opened mid-session
+    // would then sit at 0/0 until the next push happened to arrive.
+    expect(await h.invoke(IPC_INVOKE.STATS_SESSION)).toMatchObject({
+      areasEntered: 4,
+      deaths: 2,
+      suicides: 1,
+      characterLevel: 71
+    })
+  })
+
+  it('answers null rather than a zeroed snapshot when the counters cannot be read', async () => {
+    const h = makeHarness()
+    h.breakStats(new Error('clock exploded'))
+
+    // `null` is "we do not know"; `{ deaths: 0 }` would be the CLAIM that nothing has
+    // happened, which the stat strip would print as confidently as a real reading. The
+    // renderer shows em-dashes for null and that is the whole point of the distinction.
+    expect(await h.invoke(IPC_INVOKE.STATS_SESSION)).toBeNull()
+  })
+})
+
+describe('push:stats', () => {
+  it('forwards a counter change to the window', () => {
+    const h = makeHarness()
+
+    const moved: SessionStatsSnapshot = {
+      startedAt: T0,
+      uptimeMs: 90_000,
+      areasEntered: 7,
+      deaths: 3,
+      suicides: 0,
+      characterLevel: 68
+    }
+    h.emitStats(moved)
+
+    expect(statsPushes(h.sent)).toEqual([moved])
+  })
+
+  it('stops broadcasting once the handlers are disposed', () => {
+    const h = makeHarness()
+
+    h.dispose()
+    h.emitStats({
+      startedAt: T0,
+      uptimeMs: 1,
+      areasEntered: 1,
+      deaths: 1,
+      suicides: 0,
+      characterLevel: 2
+    })
+
+    // A listener left attached to a `SessionStats` that outlives the window is a send to
+    // a destroyed `webContents` on the next death.
+    expect(statsPushes(h.sent)).toEqual([])
+  })
+})
 
 // ---------------------------------------------------------------------------
 // character:active

@@ -47,6 +47,10 @@
  *  - the character tracker must exist before the watcher, which asks it who "me" is
  *    once per LINE and hands level-ups back in, so that a level-up encountered
  *    mid-stream changes `isSelf` for the lines after it;
+ *  - the session counters must exist before the watcher for the same reason the trackers
+ *    do - they subscribe in their constructor and count LIVE events, so anything
+ *    published first is simply never counted - and after the character tracker, whose
+ *    resolved level they read rather than keeping a second copy of;
  *  - the zone tracker must exist before the clipper, which snapshots `zones.current`
  *    at death-admission time;
  *  - the clipper must exist before the upload queue, which subscribes to its POST-MOVE
@@ -138,6 +142,7 @@ import {
   type ClipTarget
 } from './obs/replay-clipper'
 import { SettingsStore, type SettingsCrypto } from './settings/store'
+import { SessionStats } from './stats/session-stats'
 import { AppUpdater } from './updater'
 import { StreamableClient, type StreamableError } from './upload/streamable-client'
 import {
@@ -201,6 +206,7 @@ interface Services {
   readonly bus: PoeEventBus
   readonly zones: ZoneTracker
   readonly characters: CharacterTracker
+  readonly stats: SessionStats
   readonly watcher: LogWatcher
   readonly obs: ObsClient
   readonly clipper: ReplayClipper
@@ -603,6 +609,25 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     }
   })
 
+  // 4b. This session's counters. Built AFTER the character tracker because it reads the
+  //     level from it rather than keeping a second copy (level-ups are sparse and the
+  //     tracker is the thing that persists them across restarts), and BEFORE the watcher
+  //     because it subscribes in its constructor and anything published before that is
+  //     simply not counted.
+  //
+  //     It counts LIVE EVENTS - it is deliberately not derived from the IPC layer's
+  //     200-entry ring buffer, which would evict the evening's early deaths and make the
+  //     total walk backwards while the user played.
+  const stats = new SessionStats({
+    bus,
+    // Passed by reference, not destructured: `CharacterTracker.active` reads `#` private
+    // fields, so a detached function would throw on `this`.
+    characters,
+    onError: (error) => {
+      log('session-stats', error)
+    }
+  })
+
   // 5. The producer. `publish` is delegated to the bus so the live tail and
   //    `replay()` share one fan-out implementation - see the bus's header.
   //
@@ -723,6 +748,10 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
   //    buffer, and anything published before it subscribes is invisible to a window
   //    that opens later in the session.
   const disposeIpc = registerIpcHandlers({
+    // The one OS fact the window's brand block needs, read here because this is the file
+    // allowed to import `electron`. In a packaged build this is the installer's version;
+    // in a dev build it is package.json's.
+    appVersion: () => app.getVersion(),
     settings,
     bus,
     obs,
@@ -744,6 +773,9 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
       },
       reconfigure: () => watcher.reconfigure()
     },
+    // `SessionStats` satisfies `StatsPort` as-is: `snapshot` is a getter and `on`/`off`
+    // mirror `TypedEmitter`, exactly like `ObsClient` and `AppUpdater` do for theirs.
+    stats,
     streamable: makeStreamablePort(streamable, streamableAbort.signal),
     // `UploadQueue` satisfies `UploadPort` as-is: `reconfigure()` is a method and
     // `on`/`off` mirror `TypedEmitter`, exactly like `ObsClient` does for `ObsPort`.
@@ -765,6 +797,7 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     bus,
     zones,
     characters,
+    stats,
     watcher,
     obs,
     clipper,
@@ -893,6 +926,15 @@ async function shutdown(services: Services): Promise<void> {
     services.zones.stop()
   } catch (error) {
     log('shutdown/zones', error)
+  }
+
+  // The session counters detach here too. `stop()` only unsubscribes and deliberately
+  // leaves the totals standing: the IPC layer is already gone by this point, but a
+  // `stats:session` answered on the way down should still be the truth rather than zeros.
+  try {
+    services.stats.stop()
+  } catch (error) {
+    log('shutdown/stats', error)
   }
 
   // Detaching the character tracker keeps its DETECTION - `stop()` only unsubscribes.

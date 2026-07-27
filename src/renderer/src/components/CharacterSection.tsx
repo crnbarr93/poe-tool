@@ -35,6 +35,19 @@
  * detection has not happened, and it offers the names main has actually seen in the log
  * as one-click choices, so the fix does not depend on the user spelling their own
  * character name from memory.
+ *
+ * THE SAME ALARM ALSO APPEARS IN THE SHELL, on every view, as a banner whose button lands
+ * on this tab (see `readiness.ts` and `ShellAlerts`). It has to: this section is two
+ * navigations from where the window opens, and a silent failure that can only be seen by
+ * a user who already suspects it is not much better than one nobody reports at all. This
+ * copy is the full version, with the picker that actually fixes it.
+ *
+ *
+ * THE "DETECTION JUST MOVED" WARNING IS NOT IN THIS FILE ANY MORE
+ * --------------------------------------------------------------
+ * It lives in `DetectionSwapNotice`, rendered by the shell, because the hook behind it can
+ * only report a swap it was MOUNTED to observe - and this component is mounted only while
+ * this tab is open. See that file's header for the failure that arrangement caused.
  */
 
 import type { ReactElement } from 'react'
@@ -42,10 +55,9 @@ import type { ReactElement } from 'react'
 import type { ActiveCharacter } from '../../../shared/events'
 import type { PoeToolApi } from '../../../shared/ipc'
 import type { AppSettings, DeepPartial } from '../../../shared/settings'
-import type { DetectionSwap } from '../detection-swap'
-import { useActiveCharacter, useCharacterSuggestions, useDetectionSwap } from '../hooks'
+import { useActiveCharacter, useCharacterSuggestions } from '../hooks'
 import { TextField } from './Fields'
-import { Section } from './Section'
+import { Panel } from './Panel'
 import type { BadgeDescriptor } from './StatusBadge'
 import { StatusBadge } from './StatusBadge'
 
@@ -134,61 +146,6 @@ function ActiveCharacterCard({
   )
 }
 
-/** `level 2` / `level unknown`, for a name whose level may never have been seen. */
-function levelPhrase(level: number | null): string {
-  return level === null ? 'level unknown' : `level ${level}`
-}
-
-/**
- * "poe-tool has just decided you are someone else."
- *
- * The second silent failure in this section, and the harder one to notice: a level-up
- * line REPLACES the detected character, so a level-2 mule (a loot character, a name
- * reservation, a league-start test) permanently displaces the level-93 character being
- * played. Main persists that - correctly; it is the only alt-swap signal there is and
- * level-ups are far too sparse to re-learn - and from then on every death reads as
- * somebody else's while the badge above still says "Auto-detected" in green.
- *
- * So the swap is honoured and then said out loud, with the displaced name offered as a
- * one-click override, because an override is the only thing that out-ranks detection.
- * `warn`, not `bad`: the app may well be right, and it is right every time a user rolls
- * a new character and starts playing it.
- */
-function DetectionSwapNotice({
-  swap,
-  onUsePrevious,
-  onDismiss
-}: {
-  readonly swap: DetectionSwap
-  readonly onUsePrevious: () => void
-  readonly onDismiss: () => void
-}): ReactElement {
-  return (
-    <div className="notice notice--warn notice--actions" role="alert">
-      <p>
-        poe-tool now thinks you are playing <strong>{swap.toName}</strong> (
-        {levelPhrase(swap.toLevel)}) — it just levelled up, which replaced{' '}
-        <strong>{swap.fromName}</strong> ({levelPhrase(swap.fromLevel)}). Only{' '}
-        {swap.toName}&apos;s deaths will be clipped from now on.
-      </p>
-      {swap.suspicious && (
-        <p>
-          That is a big drop in level. A mule or a throwaway character levelling once is
-          enough to cause this, and the change is remembered across restarts.
-        </p>
-      )}
-      <div className="row">
-        <button className="button button--small" type="button" onClick={onUsePrevious}>
-          No — keep {swap.fromName}
-        </button>
-        <button className="button button--small" type="button" onClick={onDismiss}>
-          That is me
-        </button>
-      </div>
-    </div>
-  )
-}
-
 export interface CharacterSectionProps {
   readonly api: PoeToolApi
   readonly settings: AppSettings
@@ -207,9 +164,6 @@ export function CharacterSection({
 }: CharacterSectionProps): ReactElement {
   const character = useActiveCharacter(api)
   const badge = describeCharacter(character)
-  const detectionSwap = useDetectionSwap(character)
-  /** Hoisted into a const so the click handler below narrows without a `?.`. */
-  const swap = detectionSwap.swap
 
   // Only ask for suggestions when they are actually going to be shown. The picker exists
   // for one dead-end state; in every other state this costs no IPC.
@@ -242,26 +196,12 @@ export function CharacterSection({
   }
 
   return (
-    <Section
-      index="2"
+    <Panel
       title="Character"
       description="Which character counts as you. Only deaths matching it are clipped."
       aside={<StatusBadge {...badge} srPrefix="Active character" />}
     >
       <ActiveCharacterCard character={character} />
-
-      {swap !== null && (
-        <DetectionSwapNotice
-          swap={swap}
-          // Picking the displaced name writes the OVERRIDE, exactly like the picker
-          // below: the user correcting the app is a manual choice, and only a manual
-          // choice can out-rank the next level-up that mule happens to get.
-          onUsePrevious={() => {
-            chooseName(swap.fromName)
-          }}
-          onDismiss={detectionSwap.dismiss}
-        />
-      )}
 
       {unidentified && (
         <div className="alert" role="alert">
@@ -288,7 +228,7 @@ export function CharacterSection({
                     : 'Names seen in your log'}
               </span>
               <button
-                className="button button--small"
+                className="btn btn-secondary"
                 type="button"
                 onClick={suggestions.refresh}
                 disabled={suggestions.loading}
@@ -344,7 +284,7 @@ export function CharacterSection({
       {override !== '' && (
         <div className="row">
           <button
-            className="button"
+            className="btn btn-secondary"
             type="button"
             onClick={() => {
               commit({ character: { override: '' } })
@@ -389,6 +329,6 @@ export function CharacterSection({
         </li>
         <li>Changes take effect on the next log line; no restart needed.</li>
       </ul>
-    </Section>
+    </Panel>
   )
 }

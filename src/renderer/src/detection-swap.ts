@@ -52,6 +52,13 @@
  * restart would mean persisting it, which is a settings-schema change for a strictly
  * smaller benefit than this covers.
  *
+ * "WHILE THE WINDOW IS OPEN" IS ONLY TRUE IF SOMETHING IS ALWAYS LISTENING. The hook
+ * around this reducer (`useDetectionSwap`) is therefore mounted in `App.tsx`, which lives
+ * for the life of the window, and the notice is rendered in the shell. It was briefly
+ * mounted inside `CharacterSection` instead - a component that exists only while Settings
+ * › Character is the open tab - which reduced this file to dead code for every user who
+ * was not sitting on that exact tab at the exact moment the mule levelled.
+ *
  * PURE, TOTAL, NO REACT. Exported separately from `hooks.ts` so it can be unit-tested
  * without a DOM - see `test/detection-swap.test.ts`.
  */

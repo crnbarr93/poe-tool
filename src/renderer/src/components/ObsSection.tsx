@@ -29,7 +29,7 @@ import { PORT_MAX, PORT_MIN } from '../../../shared/settings'
 import { describeError, formatEpochClock } from '../format'
 import { useObsStatus } from '../hooks'
 import { NumberField, TextField, ToggleField } from './Fields'
-import { Section } from './Section'
+import { Panel } from './Panel'
 import type { BadgeDescriptor } from './StatusBadge'
 import { StatusBadge } from './StatusBadge'
 
@@ -134,8 +134,7 @@ export function ObsSection({
   }
 
   return (
-    <Section
-      index="3"
+    <Panel
       title="OBS"
       description="poe-tool asks OBS to save its replay buffer. OBS does the recording; nothing here touches the game."
       aside={<StatusBadge {...badge} srPrefix="OBS" />}
@@ -186,7 +185,7 @@ export function ObsSection({
       />
 
       <div className="row">
-        <button className="button" type="button" onClick={runTest} disabled={testing}>
+        <button className="btn btn-secondary" type="button" onClick={runTest} disabled={testing}>
           {testing ? 'Testing…' : 'Test connection'}
         </button>
         <span className="row__note">Connects once, reads the version, disconnects again.</span>
@@ -203,6 +202,6 @@ export function ObsSection({
       {testResult !== null && !testResult.ok && (
         <p className="notice notice--bad">Could not connect: {testResult.error}</p>
       )}
-    </Section>
+    </Panel>
   )
 }

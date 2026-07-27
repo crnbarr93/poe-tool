@@ -52,7 +52,7 @@ import type { AppSettings, DeepPartial } from '../../../shared/settings'
 import { describeError } from '../format'
 import { useCredentialStatus } from '../hooks'
 import { TextField, ToggleField } from './Fields'
-import { Section } from './Section'
+import { Panel } from './Panel'
 import type { BadgeDescriptor } from './StatusBadge'
 import { StatusBadge } from './StatusBadge'
 
@@ -214,8 +214,7 @@ export function StreamableSection({
   const badge = describeStreamable(streamable, havePassword && haveEmail)
 
   return (
-    <Section
-      index="5"
+    <Panel
       title="Streamable uploads"
       description="Optionally publish each death clip to your own Streamable account and get a link you can share."
       aside={<StatusBadge {...badge} srPrefix="Streamable" />}
@@ -302,7 +301,7 @@ export function StreamableSection({
       <CredentialNotice slot={slot} obs={obsSlot} />
 
       <div className="row">
-        <button className="button" type="button" onClick={runTest} disabled={!canTest}>
+        <button className="btn btn-secondary" type="button" onClick={runTest} disabled={!canTest}>
           {testing ? 'Checking…' : 'Test credentials'}
         </button>
         <span className="row__note">
@@ -358,6 +357,6 @@ export function StreamableSection({
           button yet.
         </li>
       </ul>
-    </Section>
+    </Panel>
   )
 }

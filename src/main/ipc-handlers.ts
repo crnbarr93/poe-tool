@@ -111,6 +111,7 @@ import {
   type ObsConnectionState,
   type ObsTestRequest,
   type ObsTestResult,
+  type SessionStatsSnapshot,
   type StreamableTestRequest,
   type StreamableTestResult,
   type UpdateState
@@ -453,8 +454,50 @@ export interface UpdaterPort {
   readonly off: (channel: 'state', listener: (state: UpdateState) => void) => unknown
 }
 
+/**
+ * What this file needs from `src/main/stats/session-stats.ts`. `SessionStats` satisfies it
+ * as-is - `snapshot` is a getter and `on`/`off` mirror `TypedEmitter`, exactly like
+ * {@link ObsPort} and {@link UpdaterPort}.
+ *
+ * A SECOND EMITTER, NOT A BUS CHANNEL, for the reason {@link ClipperPort} and
+ * {@link UploadPort} are: `PoeEventMap` describes log-derived events and the state derived
+ * from them, and a running total is neither.
+ *
+ * READ-ONLY, and there is deliberately no `reset()`. A "clear my session" button would be
+ * a control that makes the numbers on screen disagree with what actually happened, which
+ * is the one thing these counters exist not to do; a session ends when the app does.
+ */
+export interface StatsPort {
+  /**
+   * The counters right now. A stored value with a fresh clock read, not a probe - cheap,
+   * side-effect free, documented as never throwing.
+   */
+  readonly snapshot: SessionStatsSnapshot
+  readonly on: (
+    channel: 'stats',
+    listener: (snapshot: SessionStatsSnapshot) => void
+  ) => unknown
+  readonly off: (
+    channel: 'stats',
+    listener: (snapshot: SessionStatsSnapshot) => void
+  ) => unknown
+}
+
 /** Everything {@link registerIpcHandlers} needs. Assembled by `src/main/index.ts`. */
 export interface IpcHandlerDeps {
+  /**
+   * The running app's version, for the window's brand block.
+   *
+   * A FUNCTION rather than a string, for the reason {@link CredentialsPort.status} is one:
+   * it keeps the read live and keeps `electron` out of this file - `app.getVersion()` is
+   * called by index.ts, which owns every OS-specific fact in the graph.
+   *
+   * Documented as never throwing. If it does anyway, the channel answers `''` and the
+   * window renders no version at all, which is the honest outcome: a version is a claim
+   * about which build the user is running, and a wrong one sends them to the wrong
+   * release notes and the wrong bug report.
+   */
+  readonly appVersion: () => string
   readonly settings: SettingsPort
   readonly bus: EventBusPort
   readonly obs: ObsPort
@@ -476,6 +519,8 @@ export interface IpcHandlerDeps {
   readonly uploads: UploadPort
   /** Whether each stored secret is present and usable. Never returns a secret. */
   readonly credentials: CredentialsPort
+  /** This session's live counters: the source of `push:stats` and of `stats:session`. */
+  readonly stats: StatsPort
   /**
    * The window to push to, or null/undefined when there is none.
    *
@@ -772,6 +817,17 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
     registered.push(channel)
   }
 
+  // Display only. `''` is the documented "could not be read" answer and the renderer shows
+  // nothing for it - see the channel's note in `src/shared/ipc.ts`.
+  register(IPC_INVOKE.APP_VERSION, () => {
+    try {
+      return deps.appVersion()
+    } catch (error) {
+      report(error, 'app:version')
+      return ''
+    }
+  })
+
   // `redactSecrets` on EVERY return path out of both settings channels - see the password
   // invariant in this file's header. It returns its argument by reference when there is
   // nothing to blank, so the common case allocates nothing.
@@ -875,6 +931,21 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   // Mirrors `obs:status`: a stored value read straight off the port. Reading it does NOT
   // trigger a check - see `UpdaterPort`.
   register(IPC_INVOKE.UPDATE_STATE, () => deps.updater.state)
+
+  register(IPC_INVOKE.STATS_SESSION, () => {
+    try {
+      return deps.stats.snapshot
+    } catch (error) {
+      // `SessionStats.snapshot` is documented as never throwing; this is the belt to that
+      // braces. `null` rather than a zeroed snapshot, and the difference is the whole
+      // point: `{ deaths: 0, areasEntered: 0 }` is not "we do not know", it is the CLAIM
+      // that nothing has happened this session - a claim the renderer would print as
+      // confidently as a real one. `null` makes the UI show nothing, which is what we
+      // actually know. Same rule as `app:version` answering `''`.
+      report(error, 'stats:session')
+      return null
+    }
+  })
 
   // `slice()` so a renderer-side mutation (or a later push) cannot reach into the
   // live buffer. The events themselves are deeply readonly value objects.
@@ -1041,6 +1112,23 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
     send(IPC_PUSH.UPDATE, state)
   }
 
+  /**
+   * A session counter moved.
+   *
+   * NOT ring-buffered, for the same reason `push:character` and `push:update` are not:
+   * this is a complete current-value snapshot rather than an occurrence, so a window that
+   * opens later reads the truth from `stats:session` instead of replaying a history of
+   * increments. That is also why the counters live in main and not in the renderer - a
+   * window that opened at 11pm still sees the whole evening's totals.
+   *
+   * `SessionStats` only emits on a real change and never on a clock tick, so this cannot
+   * become a once-a-second heartbeat into a window that is doing nothing.
+   */
+  const onSessionStats = (snapshot: SessionStatsSnapshot): void => {
+    if (disposed) return
+    send(IPC_PUSH.STATS, snapshot)
+  }
+
   // Subscribing to `event` (rather than to each of `zone-entered`/`area-generated`/
   // `death`) is what makes this exactly-once: the bus fans every PoeEvent out on
   // `event` IN ADDITION to its per-type channel, so listening to both would show the
@@ -1056,6 +1144,7 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
   deps.clipper.on('clip', onClipSaved)
   deps.uploads.on('upload', onUploadUpdate)
   deps.updater.on('state', onUpdateState)
+  deps.stats.on('stats', onSessionStats)
 
   // -------------------------------------------------------------------------
   // Teardown
@@ -1107,6 +1196,15 @@ export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
       deps.updater.off('state', onUpdateState)
     } catch (error) {
       report(error, 'teardown:updater')
+    }
+
+    // The counters outlive this registration - `SessionStats` keeps counting with no
+    // window open - so the listener has to come off, or a snapshot emitted during
+    // shutdown would reach a `webContents.send` for a window being destroyed.
+    try {
+      deps.stats.off('stats', onSessionStats)
+    } catch (error) {
+      report(error, 'teardown:stats')
     }
 
     recentEvents.length = 0
