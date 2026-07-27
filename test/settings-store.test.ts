@@ -558,7 +558,7 @@ describe('home directory expansion', () => {
   })
 
   it('leaves an absolute path untouched', () => {
-    const absolute = join('/', 'Users', 'connorbarr', 'Downloads', 'Client.txt')
+    const absolute = join('/', 'Users', 'someone-else', 'Downloads', 'Client.txt')
     const store = makeStore({ homeDir: HOME })
     expect(store.save({ log: { path: absolute } }).log.path).toBe(absolute)
   })

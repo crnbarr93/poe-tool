@@ -6,11 +6,11 @@
  * wires them to each other and to the IPC layer, and tears the whole thing down
  * exactly once on quit.
  *
- * This is one of exactly three files allowed to import `electron` (the others being
- * `src/main/ipc-handlers.ts` and - only through an injected directory path -
- * `src/main/settings/store.ts`). Everything it assembles is electron-free and
- * therefore unit-testable on its own; this file is the seam where the OS-specific
- * facts (userData directory, Videos directory, renderer URL) enter the graph.
+ * This is one of exactly four files allowed to import `electron` (the others being
+ * `src/main/ipc-handlers.ts`, `src/main/updater.ts` and - only through an injected
+ * directory path - `src/main/settings/store.ts`). Everything it assembles is
+ * electron-free and therefore unit-testable on its own; this file is the seam where the
+ * OS-specific facts (userData directory, Videos directory, renderer URL) enter the graph.
  *
  *
  * THE RENDERER IS NEVER ON THE CRITICAL PATH
@@ -35,6 +35,8 @@
  *                  └──► ObsClient ────┴──► ReplayClipper ◄───────────┘  (death:self)
  *                                                │
  *                       registerIpcHandlers ◄────┴── clips + bus + obs + watcher
+ *                                 ▲
+ *                       AppUpdater ┘  (independent - depends on nothing, feeds only IPC)
  * ```
  *  - the bus must exist before the watcher (the watcher publishes onto it) and before
  *    the zone tracker, character tracker and clipper (they subscribe to it);
@@ -92,6 +94,7 @@ import {
   type ClipTarget
 } from './obs/replay-clipper'
 import { SettingsStore } from './settings/store'
+import { AppUpdater } from './updater'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -146,6 +149,7 @@ interface Services {
   readonly watcher: LogWatcher
   readonly obs: ObsClient
   readonly clipper: ReplayClipper
+  readonly updater: AppUpdater
   readonly disposeIpc: () => void
 }
 
@@ -297,7 +301,33 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     if (isClipFailure(outcome)) log(`clip/${outcome.kind}`, outcome.message)
   })
 
-  // 8. IPC last, and BEFORE the watcher starts - it owns the `events:recent` ring
+  // 8. Auto-update. Depends on NOTHING above it and feeds nothing below it - it is here
+  //    purely so the IPC layer can push its state at the window. Constructing it is
+  //    cheap: in an unpackaged build it pins itself to `disabled-in-dev` and never
+  //    touches electron-updater at all, and in a packaged one it only attaches
+  //    listeners. The single network check is deferred to `start()`.
+  //
+  //    IT ALSO CANNOT THROW, which matters more than it looks: a throw here would leave
+  //    `services` null, so `openWindow()` and `watcher.start()` below would never run
+  //    and the user would get a process holding the single-instance lock and nothing
+  //    else - no window, no tailing, no clips - because an update check went wrong.
+  //    That guarantee lives in `AppUpdater`'s constructor, which wraps its own attach
+  //    (electron-updater's platform updater throws on a non-semver app version); see
+  //    RULE 2 in `./updater.ts`. Do not weaken it there without adding a guard here.
+  //
+  //    It deliberately does NOT subscribe to the bus and is NOT drained on shutdown
+  //    beyond removing its listeners: a downloaded update installs from
+  //    electron-updater's own `quit` handler, long after everything here is torn down.
+  const updater = new AppUpdater({
+    onError: (error, context) => {
+      log(`updater/${context}`, error)
+    },
+    onInfo: (message, context) => {
+      log(`updater/${context}`, message)
+    }
+  })
+
+  // 9. IPC last, and BEFORE the watcher starts - it owns the `events:recent` ring
   //    buffer, and anything published before it subscribes is invisible to a window
   //    that opens later in the session.
   const disposeIpc = registerIpcHandlers({
@@ -305,6 +335,9 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     bus,
     obs,
     clipper,
+    // `AppUpdater` satisfies `UpdaterPort` as-is: `state` is a getter and `on`/`off`
+    // mirror `TypedEmitter`, exactly like `ObsClient` does for `ObsPort`.
+    updater,
     // `CharacterTracker` satisfies `CharacterPort` as-is: `active()` and
     // `refreshOverride()` are both methods, and the port asks for exactly those two.
     // Passed by reference rather than adapted, so the IPC layer calls them as members
@@ -325,7 +358,7 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     }
   })
 
-  return { settings, bus, zones, characters, watcher, obs, clipper, disposeIpc }
+  return { settings, bus, zones, characters, watcher, obs, clipper, updater, disposeIpc }
 }
 
 /**
@@ -340,6 +373,18 @@ async function start(services: Services): Promise<void> {
     await services.watcher.start()
   } catch (error) {
     log('startup/watcher', error)
+  }
+
+  // Fire-and-forget, and deliberately AFTER the watcher: an update check is the least
+  // important thing this process does and must never delay the tail loop attaching.
+  // `checkOnLaunch` is documented as never rejecting - a `.catch` is attached anyway
+  // because an unhandled rejection here would be reported as an app-level defect.
+  try {
+    void services.updater.checkOnLaunch().catch((error: unknown) => {
+      log('startup/update-check', error)
+    })
+  } catch (error) {
+    log('startup/update-check', error)
   }
 
   const { obs } = services.settings.get()
@@ -383,6 +428,18 @@ async function shutdown(services: Services): Promise<void> {
     services.disposeIpc()
   } catch (error) {
     log('shutdown/ipc', error)
+  }
+
+  // 2b. Detach the updater. Removes every listener it put on electron-updater's module
+  //     singleton (which outlives this instance) and on its own emitter.
+  //
+  //     It does NOT cancel a download and does NOT disarm install-on-quit, and must not:
+  //     applying a downloaded update on quit is the whole design, and electron-updater
+  //     drives that from its own `app.on('quit')` handler, which is untouched by this.
+  try {
+    services.updater.dispose()
+  } catch (error) {
+    log('shutdown/updater', error)
   }
 
   // 3. Drain the clipper BEFORE closing OBS: a clip mid-move must not be abandoned

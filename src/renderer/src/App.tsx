@@ -21,6 +21,7 @@ import { ClipsSection } from './components/ClipsSection'
 import { EventFeedSection } from './components/EventFeedSection'
 import { LogSourceSection } from './components/LogSourceSection'
 import { ObsSection } from './components/ObsSection'
+import { UpdateStatus } from './components/UpdateStatus'
 import { getBridge, useSettingsController } from './hooks'
 
 /**
@@ -118,9 +119,17 @@ function ConfigApp({ api }: ConfigAppProps): ReactElement {
         <EventFeedSection api={api} />
       </main>
 
+      {/*
+        The update line lives in the footer rather than in a section of its own: it is
+        not something the user configures, it has no controls, and in the steady state it
+        renders nothing at all. See UpdateStatus.tsx.
+      */}
       <footer className="app__footer">
-        poe-tool never reads game memory, never injects anything, and never sends input to the
-        game. It reads one log file.
+        <p className="app__footer-note">
+          poe-tool never reads game memory, never injects anything, and never sends input to the
+          game. It reads one log file.
+        </p>
+        <UpdateStatus api={api} />
       </footer>
     </div>
   )
