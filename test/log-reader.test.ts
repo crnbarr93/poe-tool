@@ -464,8 +464,11 @@ describe('missing and unreadable files', () => {
   })
 
   it('reports read-error (never throws) when the path is not a readable file', async () => {
-    // A directory: `open` succeeds on POSIX and the read fails with EISDIR;
-    // Windows fails at `open`. Either way it must surface as data.
+    // A directory. The original comment here claimed Windows fails at `open` - it does
+    // NOT, and the first Windows CI run proved it: `open` SUCCEEDS on a directory there
+    // and the handle reports size 0, so this returned `ok` and would have tailed nothing
+    // forever behind a healthy status badge. LogReader now rejects anything that is not
+    // a regular file via `stat.isFile()`, which makes the two platforms agree.
     const reader = new LogReader(dir)
 
     const result = await reader.readDelta()
@@ -473,6 +476,21 @@ describe('missing and unreadable files', () => {
     expect(result.lines).toEqual([])
     expect(result.bytesRead).toBe(0)
     expect(result.error).toBeTypeOf('string')
+  })
+
+  it('keeps reporting read-error for a directory without advancing the offset', async () => {
+    // The watcher polls forever, so the non-file case must be stable rather than
+    // degrading: no throw, no offset drift, and never a spurious `ok` that would let the
+    // status badge claim the log is being tailed.
+    const reader = new LogReader(dir)
+
+    for (let i = 0; i < 3; i += 1) {
+      const result = await reader.readDelta()
+      expect(result.status).toBe('read-error')
+      expect(result.bytesRead).toBe(0)
+      expect(result.lines).toEqual([])
+      expect(result.backlog).toBe(false)
+    }
   })
 })
 
