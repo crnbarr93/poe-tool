@@ -36,7 +36,7 @@ import {
   type ClipSettings
 } from '../src/shared/settings'
 import { TypedEmitter } from '../src/main/events/typed-emitter'
-import type { MoveClipOptions } from '../src/main/obs/clip-library'
+import { newClipId, type MoveClipOptions } from '../src/main/obs/clip-library'
 import type { ObsError, ObsResult, SavedReplay } from '../src/main/obs/obs-client'
 import {
   ReplayClipper,
@@ -184,6 +184,11 @@ class FakeClipLibrary implements ClipTarget {
       if (this.throwWith !== null) throw this.throwWith
 
       const core = {
+        // Minted with the real function rather than a literal, so this stub cannot
+        // drift from `ClipLibrary`'s own contract that every record it returns carries a
+        // unique id and a birth upload state. See `newClipId` for why.
+        id: newClipId(),
+        upload: { state: 'disabled' } as const,
         savedAt: options.when.getTime(),
         originalPath: options.sourcePath,
         zoneName: options.zone.displayName,

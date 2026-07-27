@@ -6,11 +6,12 @@
  * wires them to each other and to the IPC layer, and tears the whole thing down
  * exactly once on quit.
  *
- * This is one of exactly four files allowed to import `electron` (the others being
- * `src/main/ipc-handlers.ts`, `src/main/updater.ts` and - only through an injected
- * directory path - `src/main/settings/store.ts`). Everything it assembles is
+ * This is one of exactly three files allowed to import `electron` (the others being
+ * `src/main/ipc-handlers.ts` and `src/main/updater.ts`). Everything it assembles is
  * electron-free and therefore unit-testable on its own; this file is the seam where the
- * OS-specific facts (userData directory, Videos directory, renderer URL) enter the graph.
+ * OS-specific facts enter the graph - the userData directory, the Videos directory, the
+ * renderer URL, and the `safeStorage` cipher that `SettingsStore` encrypts passwords
+ * with but may not import (see {@link makeSettingsCrypto}).
  *
  *
  * THE RENDERER IS NEVER ON THE CRITICAL PATH
@@ -32,9 +33,12 @@
  *                  │                              ZoneTracker ◄──────┤
  *                  │                                    │            │
  *                  ├──► ClipLibrary ──┐                 │            │
- *                  └──► ObsClient ────┴──► ReplayClipper ◄───────────┘  (death:self)
+ *                  ├──► ObsClient ────┴──► ReplayClipper ◄───────────┘  (death:self)
+ *                  │                             │    │
+ *                  │      StreamableClient ──┐   │    └── clip (POST-MOVE)
+ *                  └──────────────────────── UploadQueue ◄─────────────┘
  *                                                │
- *                       registerIpcHandlers ◄────┴── clips + bus + obs + watcher
+ *                       registerIpcHandlers ◄────┴── clips + uploads + bus + obs + watcher
  *                                 ▲
  *                       AppUpdater ┘  (independent - depends on nothing, feeds only IPC)
  * ```
@@ -45,23 +49,52 @@
  *    mid-stream changes `isSelf` for the lines after it;
  *  - the zone tracker must exist before the clipper, which snapshots `zones.current`
  *    at death-admission time;
+ *  - the clipper must exist before the upload queue, which subscribes to its POST-MOVE
+ *    `clip` channel - NEVER to `death:self`, so no part of uploading can sit on the
+ *    death path or delay a clip reaching disk;
  *  - `registerIpcHandlers` must run BEFORE `watcher.start()`, because it owns the
  *    `events:recent` ring buffer and anything published before it subscribes is lost
- *    to a window that opens later.
+ *    to a window that opens later;
+ *  - and it must also run before the UPLOAD QUEUE subscribes, which is why the queue is
+ *    constructed, immediately `stop()`ped, and `start()`ed again after registration.
+ *    `handleClip` publishes its first upload state synchronously inside the clipper's
+ *    `clip` emit, and listeners fire in subscription order, so a queue that subscribed
+ *    first would publish that state before the IPC layer had the clip in its
+ *    `clips:recent` buffer - and for a clip whose first update is also its last
+ *    (uploading off, or a clip that was never moved) that is the only update there will
+ *    ever be. See the comment on `uploads.stop()` in {@link createServices}.
  *
  *
  * WHY SO MANY LITTLE ADAPTER OBJECTS
  * ----------------------------------
  * `ipc-handlers.ts` depends on structural PORTS, not on these classes (see its
  * header). Most of them are satisfied as-is - `SettingsStore` already IS a
- * `SettingsPort`. The two that are not get a three-line adapter here, which is
- * exactly where that adaptation belongs: this file owns the wiring, and smearing it
- * through the handlers would couple them to concrete classes.
+ * `SettingsPort`, and `UploadQueue` already IS an `UploadPort`. The ones that are not
+ * get a small adapter here, which is exactly where that adaptation belongs: this file
+ * owns the wiring, and smearing it through the handlers would couple them to concrete
+ * classes.
  *
  * The clip library gets one for a second reason: `ClipLibrary` is constructed with a
  * directory, but `settings.clips.libraryDir` can change at runtime. {@link makeClipTarget}
  * re-creates it when the setting moves, so a user who repoints their clips folder does
  * not have to restart the app.
+ *
+ * The Streamable adapters exist for a third reason, and it is the important one: the
+ * upload queue deliberately declares its OWN error vocabulary rather than importing the
+ * client's, so that every assumption about Streamable's unofficial upload endpoint stays
+ * in one file. {@link toUploadError} and {@link makeUploadClient} are the seam where the
+ * two vocabularies meet, and they are the only place in the app that knows both.
+ *
+ *
+ * THE PASSWORD NEVER PASSES THROUGH THIS FILE'S HANDS FOR LONGER THAN AN `await`
+ * ------------------------------------------------------------------------------
+ * This repository is PUBLIC and the Streamable credential is a real account password.
+ * {@link makeUploadClient} reads it out of the store at the moment of each request and
+ * hands it straight to the one module allowed to build an `Authorization` header with
+ * it. It is never captured on an adapter object, never given to the queue (which asks
+ * `hasCredentials`, a boolean), and never passed to {@link log} - the credential
+ * diagnostics below log a STATUS word, and the Streamable client's `onInternalError`
+ * hook is given only its context string.
  *
  *
  * TEARDOWN AND macOS
@@ -76,12 +109,23 @@
 
 import { join } from 'node:path'
 
-import { app, BrowserWindow, shell, type BrowserWindowConstructorOptions } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  safeStorage,
+  shell,
+  type BrowserWindowConstructorOptions
+} from 'electron'
 
 import type { WatcherStatus } from '../shared/events'
-import type { ClipRecord } from '../shared/ipc'
+import type {
+  ClipRecord,
+  CredentialsStatusResult,
+  StreamableTestRequest,
+  StreamableTestResult
+} from '../shared/ipc'
 import { PoeEventBus } from './events/event-bus'
-import { registerIpcHandlers } from './ipc-handlers'
+import { registerIpcHandlers, type CredentialsPort, type StreamablePort } from './ipc-handlers'
 import { CharacterTracker } from './log/character-tracker'
 import { LogWatcher } from './log/log-watcher'
 import { ZoneTracker } from './log/zone-tracker'
@@ -93,8 +137,19 @@ import {
   type ClipOutcome,
   type ClipTarget
 } from './obs/replay-clipper'
-import { SettingsStore } from './settings/store'
+import { SettingsStore, type SettingsCrypto } from './settings/store'
 import { AppUpdater } from './updater'
+import { StreamableClient, type StreamableError } from './upload/streamable-client'
+import {
+  UploadQueue,
+  type UploadClient,
+  type UploadClientResult,
+  type UploadError,
+  type UploadErrorKind,
+  type UploadedVideo,
+  type VideoReadiness,
+  type VideoStatus
+} from './upload/upload-queue'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -149,7 +204,18 @@ interface Services {
   readonly watcher: LogWatcher
   readonly obs: ObsClient
   readonly clipper: ReplayClipper
+  readonly uploads: UploadQueue
   readonly updater: AppUpdater
+  /**
+   * Cancels the credential checks driven from `streamable:test`.
+   *
+   * SEPARATE FROM THE QUEUE'S OWN CONTROLLER, which `UploadQueue.dispose()` owns and
+   * fires for the uploads and status polls it started. A `testCredentials` request comes
+   * from the window rather than from the queue, so nothing else is holding a handle on
+   * it, and a quit while one is in flight would otherwise sit on an open socket for the
+   * full request timeout with `before-quit` waiting on it.
+   */
+  readonly streamableAbort: AbortController
   readonly disposeIpc: () => void
 }
 
@@ -174,6 +240,55 @@ function defaultClipsDir(): string {
 }
 
 /**
+ * Wraps electron's `safeStorage` as the {@link SettingsCrypto} pair `SettingsStore`
+ * encrypts `obs.password` and `streamable.password` with.
+ *
+ * This function exists because `src/main/settings/store.ts` may not import electron, and
+ * because `safeStorage` is NOT USABLE BEFORE `app.whenReady()` - on Linux it has to
+ * resolve a keyring backend first, and asking early gets the wrong answer rather than an
+ * error. Everything below therefore runs from `createServices`, which only ever runs
+ * inside the `whenReady` continuation.
+ *
+ * BASE64, NOT A BUFFER. `encryptString` hands back a `Buffer`, but the value has to
+ * survive `JSON.stringify` into a hand-editable text file and come back identical, and a
+ * Buffer round-trips through JSON as `{"type":"Buffer","data":[...]}`. Base64 is the one
+ * representation that stays a single opaque string that nobody is tempted to edit.
+ *
+ * WHAT IS GUARDED, AND WHAT MUST NOT BE
+ * -------------------------------------
+ * `isEncryptionAvailable()` is the only safeStorage call made during bootstrap, so it is
+ * the only one whose throwing could abort startup - a platform without a keyring must
+ * cost the user their stored passwords, never their app. It is wrapped, and a failure
+ * degrades to `available: false`, which the store reads as "hold passwords for this
+ * session and persist nothing".
+ *
+ * `encrypt` and `decrypt` are deliberately NOT wrapped, and that is load-bearing rather
+ * than an oversight. They are only ever called from inside `SettingsStore`, which
+ * catches both and - crucially - classifies them DIFFERENTLY: a `decrypt` throw is
+ * `'undecryptable'` ("this file came from another machine; type your password again")
+ * while an `encrypt` throw is `'unavailable'`. Swallowing a decrypt failure here and
+ * returning `''` would collapse that distinction into a password field that merely looks
+ * empty, which is precisely the silent failure the whole credential-status channel
+ * exists to prevent.
+ */
+function makeSettingsCrypto(): SettingsCrypto {
+  let available = false
+  try {
+    available = safeStorage.isEncryptionAvailable()
+  } catch (error) {
+    // Documented as throwing on a platform where the OS keyring is missing or broken.
+    log('safe-storage/availability', error)
+    available = false
+  }
+
+  return {
+    available,
+    encrypt: (plain: string): string => safeStorage.encryptString(plain).toString('base64'),
+    decrypt: (cipher: string): string => safeStorage.decryptString(Buffer.from(cipher, 'base64'))
+  }
+}
+
+/**
  * Builds the `ClipTarget` the replay clipper writes through.
  *
  * Re-creates the underlying `ClipLibrary` whenever `settings.clips.libraryDir` moves,
@@ -194,6 +309,224 @@ function makeClipTarget(settings: SettingsStore): ClipTarget {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Streamable adapters
+// ---------------------------------------------------------------------------
+
+/**
+ * Translates one {@link StreamableError} into the vendor-free {@link UploadError} the
+ * upload queue reasons about.
+ *
+ * THIS FUNCTION IS THE WHOLE POINT OF THE SPLIT. `src/main/upload/streamable-client.ts`
+ * owns every assumption about Streamable's HTTP surface; `src/main/upload/upload-queue.ts`
+ * owns the retry policy and the user-facing wording and deliberately declares its own
+ * error vocabulary (see its header on why `UploadClient` is declared there rather than
+ * imported). The two never meet - this file is where they are joined, exactly like
+ * {@link makeClipTarget} joins the clipper to a library whose directory can move.
+ *
+ * THE ONE MAPPING THAT IS A JUDGEMENT CALL is `unexpected-response`. The queue splits its
+ * kinds by ONE question - is retrying worth anything - and that question has two answers
+ * here:
+ *  - a 5xx is Streamable having a bad day, which is `server-error` and IS retried;
+ *  - anything else (a 4xx we do not recognise, or a 2xx whose body we could not narrow)
+ *    is the UNDOCUMENTED endpoint's contract having moved, which is `bad-response`,
+ *    is NOT retried, and produces the "poe-tool probably needs an update" message.
+ * Collapsing both into `bad-response` would abandon a clip because Streamable restarted a
+ * server; collapsing both into `server-error` would burn four attempts and 42 seconds
+ * re-asking a question whose answer cannot change until this repository does.
+ *
+ * `message` is carried across verbatim: the client documents it as human-readable, safe
+ * to render, and ALREADY SCRUBBED OF THE PASSWORD in every form (plaintext, base64
+ * credential and full `Basic ...` header). Nothing is added to it here, because this
+ * function has no secret in scope to add.
+ *
+ * PURE and TOTAL: never throws.
+ */
+function toUploadError(error: StreamableError): UploadError {
+  return {
+    kind: toUploadErrorKind(error),
+    message: error.message,
+    retryAfterMs: error.kind === 'rate-limited' ? error.retryAfterMs : null
+  }
+}
+
+/** The `kind` half of {@link toUploadError}. EXHAUSTIVE, so a new vendor error kind is a compile error. */
+function toUploadErrorKind(error: StreamableError): UploadErrorKind {
+  switch (error.kind) {
+    case 'auth-failed':
+      return 'auth-failed'
+    case 'file-too-large':
+      return 'file-too-large'
+    case 'file-unreadable':
+      return 'file-unreadable'
+    case 'network':
+      return 'network'
+    case 'rate-limited':
+      return 'rate-limited'
+    case 'timeout':
+      return 'timeout'
+    case 'aborted':
+      return 'aborted'
+    case 'unexpected-response':
+      // See the note in `toUploadError`: 5xx is transient, everything else is a contract
+      // change. A null status means the failure was in PARSING rather than in an HTTP
+      // status, which is a contract change by definition.
+      return error.status !== null && error.status >= 500 ? 'server-error' : 'bad-response'
+    case 'processing-failed':
+      // UNREACHABLE THROUGH EITHER `UploadClient` METHOD. It is only ever produced by
+      // `awaitReady`, and `getVideoStatus` below intercepts it and reports it as the
+      // readiness word `'error'` - which is what the queue is built to render, and which
+      // says the true thing ("Streamable could not process this clip") instead of the
+      // false one ("poe-tool needs an update"). This arm exists so the switch stays
+      // total, not because anything depends on the value.
+      return 'bad-response'
+  }
+}
+
+/** Streamable's numeric video status, as the readiness word the queue speaks. */
+function readinessFromStatus(status: number | undefined): VideoReadiness {
+  // `undefined` is the ordinary "the video is not visible to us yet" case - the client
+  // treats a 404 as pending and never reports a number for it - and "not visible yet" is
+  // the earliest point of the same progression, so it reads as `uploading`.
+  if (status === undefined) return 'uploading'
+  return status === 1 ? 'processing' : 'uploading'
+}
+
+/**
+ * Adapts the {@link StreamableClient} to the {@link UploadClient} the queue was written
+ * against.
+ *
+ * READS THE STORE ON EVERY CALL rather than capturing the credential, and that is the
+ * design rather than a convenience:
+ *  - a password the user re-types in the config window takes effect on the very next
+ *    upload, with nothing to invalidate and no copy to go stale. `UploadClient.reconfigure`
+ *    is therefore deliberately NOT implemented - there is nothing to re-read, because
+ *    nothing was ever cached. `UploadPort.reconfigure` in `./ipc-handlers.ts` is still
+ *    called on every settings save; the queue's own half of it (reporting a backlog that
+ *    is now switched off) is what does the work.
+ *  - the plaintext exists only for the duration of one `await`, inside the module that
+ *    puts it in an `Authorization` header. It is never stored on this object, never
+ *    passed to the queue (which asks `hasCredentials`, a boolean), and never reaches an
+ *    outcome, a log line or an IPC payload.
+ */
+function makeUploadClient(
+  streamable: StreamableClient,
+  settings: SettingsStore
+): UploadClient {
+  return {
+    // A GETTER, not a captured boolean: the answer changes the moment the user saves
+    // credentials, and the queue asks it again for every clip it admits.
+    get hasCredentials(): boolean {
+      const { email, password } = settings.get().streamable
+      return email.trim() !== '' && password !== ''
+    },
+
+    upload: async (request): Promise<UploadClientResult<UploadedVideo>> => {
+      const account = settings.get().streamable
+      const result = await streamable.upload({
+        filePath: request.filePath,
+        email: account.email,
+        password: account.password,
+        // The queue already refused anything over this, so the client's own check can
+        // only fire if the file grew between the two - but it costs nothing and keeps
+        // the client usable on its own terms.
+        maxBytes: account.maxFileBytes,
+        signal: request.signal
+      })
+      if (!result.ok) return { ok: false, error: toUploadError(result.error) }
+      // Narrowed to the two fields the queue's contract names. The client's own
+      // `UploadedVideo` also carries the size and a status that the undocumented upload
+      // response may or may not have contained; neither crosses this seam.
+      return { ok: true, value: { shortcode: result.value.shortcode, url: result.value.url } }
+    },
+
+    getVideoStatus: async (shortcode, signal): Promise<UploadClientResult<VideoStatus>> => {
+      const account = settings.get().streamable
+
+      // ONE REQUEST, NOT A POLL LOOP. `awaitReady` is a loop by default, and the queue is
+      // already one (`#awaitReady`, bounded by `maxStatusPolls` with its own interval).
+      // Nesting them would multiply into hundreds of requests per clip to a third party,
+      // which is how an app earns a rate limit. `maxWaitMs: 0` collapses it to a single
+      // `GET /videos/{shortcode}` - the OFFICIAL, documented endpoint - and hands the
+      // schedule back to the queue, which is where it belongs.
+      //
+      // The consequence is that "not ready yet" comes back as a `timeout` error rather
+      // than as data, so the numeric status is captured through `onStatus` on the way
+      // past. An array rather than a mutable `number | null`, because a value assigned
+      // only inside a callback stays narrowed to its initialiser as far as the compiler
+      // is concerned.
+      const observed: number[] = []
+
+      const result = await streamable.awaitReady(shortcode, {
+        email: account.email,
+        password: account.password,
+        signal,
+        maxWaitMs: 0,
+        onStatus: (status) => {
+          observed.push(status)
+        }
+      })
+
+      if (result.ok) return { ok: true, value: { readiness: 'ready', message: null } }
+
+      // Streamable took the video and its own transcode failed. NOT a client failure:
+      // this is an answer, and the queue renders it as such (naming the local file and
+      // suggesting a manual re-upload) rather than as "we could not check".
+      if (result.error.kind === 'processing-failed') {
+        return { ok: true, value: { readiness: 'error', message: result.error.message } }
+      }
+
+      // `shortcode !== null` distinguishes "we asked and it is still working" - the
+      // expected outcome of `maxWaitMs: 0`, and an ordinary in-progress answer - from a
+      // request that genuinely timed out on the wire, which has no shortcode and is a
+      // transient failure the queue should keep polling through.
+      if (result.error.kind === 'timeout' && result.error.shortcode !== null) {
+        return { ok: true, value: { readiness: readinessFromStatus(observed.at(-1)), message: null } }
+      }
+
+      return { ok: false, error: toUploadError(result.error) }
+    }
+  }
+}
+
+/**
+ * Adapts the {@link StreamableClient} to the {@link StreamablePort} the `streamable:test`
+ * handler calls.
+ *
+ * ONLY THE MESSAGE CROSSES BACK. `StreamableError.message` is documented as
+ * human-readable and as having been scrubbed of the password in all three forms it could
+ * appear in; the rest of the error (a status, a body snippet, a byte count) stays in the
+ * main process. The credentials come IN from the handler, which has already substituted
+ * the stored password for the renderer's redacted blank.
+ *
+ * The app-level `signal` is what lets a quit cancel a check that is sitting on a socket.
+ */
+function makeStreamablePort(
+  streamable: StreamableClient,
+  signal: AbortSignal
+): StreamablePort {
+  return {
+    testCredentials: async (request: StreamableTestRequest): Promise<StreamableTestResult> => {
+      const result = await streamable.testCredentials(request.email, request.password, { signal })
+      return result.ok ? { ok: true } : { ok: false, error: result.error.message }
+    }
+  }
+}
+
+/**
+ * Adapts {@link SettingsStore.credentials} to {@link CredentialsPort}.
+ *
+ * A three-line adapter rather than passing the store, for the reason the header gives:
+ * `credentials` is a GETTER, and a plain object literal built once at wiring time would
+ * snapshot it forever - so a password re-typed after a failed decrypt would keep
+ * reporting `'undecryptable'` until the app restarted. This keeps the read live.
+ */
+function makeCredentialsPort(settings: SettingsStore): CredentialsPort {
+  return {
+    status: (): CredentialsStatusResult => settings.credentials
+  }
+}
+
 /**
  * Constructs and wires every service. Performs no I/O beyond reading `settings.json`
  * and does NOT start the watcher - {@link start} does that, after the IPC layer is
@@ -201,13 +534,28 @@ function makeClipTarget(settings: SettingsStore): ClipTarget {
  */
 function createServices(getWindow: () => BrowserWindow | null): Services {
   // 1. Settings first: everything else reads from it. `load()` never throws - a
-  //    corrupt or missing file resolves to defaults, because a user who mangled their
-  //    settings needs a working settings UI to fix them in.
+  //    corrupt or missing file, or a password blob this machine cannot decrypt, all
+  //    resolve to something usable, because a user who mangled their settings needs a
+  //    working settings UI to fix them in.
   const settings = new SettingsStore({
     dir: app.getPath('userData'),
-    defaultLibraryDir: defaultClipsDir()
+    defaultLibraryDir: defaultClipsDir(),
+    crypto: makeSettingsCrypto()
   })
   settings.load()
+
+  // Nothing in this app fails silently, and a password that did not come back is the
+  // easiest failure in it to miss: uploads simply stop, and the settings field looks the
+  // same as it does on a fresh install. The window reports this properly through
+  // `credentials:status`; this line is for the case where there is no window - a
+  // console-launched build, or a bug report with a log and no screenshot.
+  //
+  // The STATUS is logged, never the secret: `CredentialSlotStatus` carries facts about a
+  // password and never the password itself, which is the entire reason it exists.
+  const credentials = settings.credentials
+  for (const [slot, state] of Object.entries(credentials)) {
+    if (state.status !== 'ok') log(`settings/credentials/${slot}`, state.status)
+  }
 
   // 2. The bus. Every producer publishes through it; every consumer subscribes to it.
   const bus = new PoeEventBus({
@@ -301,6 +649,50 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
     if (isClipFailure(outcome)) log(`clip/${outcome.kind}`, outcome.message)
   })
 
+  // 7b. Streamable. THE UPLOAD ENDPOINT IS UNOFFICIAL - every assumption about it lives
+  //     in `./upload/streamable-client.ts` and that file's header is the one to read
+  //     before touching any of this. Constructing it does nothing: it holds no
+  //     connection, no credential and no state, and the first byte only leaves the
+  //     machine when a clip is filed with uploading switched on.
+  //
+  //     `onInternalError` is handed the value a caller-supplied callback threw. It is
+  //     logged as a CONTEXT ONLY, never with the error's own text, because the one thing
+  //     that could plausibly be inside such a value is a request dump - and this repo is
+  //     public.
+  const streamableAbort = new AbortController()
+  const streamable = new StreamableClient({
+    onInternalError: (_error, context) => {
+      log('streamable', context)
+    }
+  })
+
+  // 7c. The upload pipeline. Subscribes to the clipper's POST-MOVE `clip` channel - not
+  //     to `death:self` - so nothing here can ever sit on the death path or delay a clip
+  //     reaching disk. See the queue's header: the local file is the artefact, the
+  //     upload is a courtesy.
+  //
+  //     IT IS DETACHED AGAIN IMMEDIATELY, AND RE-ATTACHED AFTER `registerIpcHandlers`.
+  //     That is not fussiness, it is an ordering bug being closed. `handleClip` runs
+  //     SYNCHRONOUSLY inside the clipper's `clip` emit and publishes its first upload
+  //     state (`pending`, `disabled` or `skipped`) before that emit returns. Listeners
+  //     fire in subscription order, so with the queue subscribed first, that first
+  //     update would be published BEFORE the IPC layer had put the clip in its
+  //     `clips:recent` ring buffer - the update would find no row to fold itself into
+  //     and be dropped, and the buffer would keep answering with the clip's birth state
+  //     forever. For a clip whose first update is also its LAST (uploading switched off,
+  //     or a clip that was never moved) that is the only update there will ever be, so a
+  //     window opened later would show a permanently wrong row. Re-subscribing here puts
+  //     the queue behind the IPC layer, where its updates always find the record.
+  const uploads = new UploadQueue({
+    clips: clipper,
+    client: makeUploadClient(streamable, settings),
+    getSettings: () => settings.get(),
+    onInternalError: (error, context) => {
+      log(`uploads/${context}`, error)
+    }
+  })
+  uploads.stop()
+
   // 8. Auto-update. Depends on NOTHING above it and feeds nothing below it - it is here
   //    purely so the IPC layer can push its state at the window. Constructing it is
   //    cheap: in an unpackaged build it pins itself to `disabled-in-dev` and never
@@ -352,13 +744,35 @@ function createServices(getWindow: () => BrowserWindow | null): Services {
       },
       reconfigure: () => watcher.reconfigure()
     },
+    streamable: makeStreamablePort(streamable, streamableAbort.signal),
+    // `UploadQueue` satisfies `UploadPort` as-is: `reconfigure()` is a method and
+    // `on`/`off` mirror `TypedEmitter`, exactly like `ObsClient` does for `ObsPort`.
+    uploads,
+    credentials: makeCredentialsPort(settings),
     getWindow,
     onError: (error, context) => {
       log(`ipc/${context}`, error)
     }
   })
 
-  return { settings, bus, zones, characters, watcher, obs, clipper, updater, disposeIpc }
+  // 10. NOW the upload queue may listen. Everything above this line is why - see the
+  //     comment on `uploads.stop()`. `start()` is idempotent and appends, so from here on
+  //     a saved clip reaches the IPC ring buffer before its first upload update does.
+  uploads.start()
+
+  return {
+    settings,
+    bus,
+    zones,
+    characters,
+    watcher,
+    obs,
+    clipper,
+    uploads,
+    updater,
+    streamableAbort,
+    disposeIpc
+  }
 }
 
 /**
@@ -449,6 +863,30 @@ async function shutdown(services: Services): Promise<void> {
     await services.clipper.dispose()
   } catch (error) {
     log('shutdown/clipper', error)
+  }
+
+  // 3b. The upload pipeline, AFTER the clipper - `clipper.dispose()` above drains a clip
+  //     that was mid-move, and the record it emits at the end of that must still be
+  //     admitted rather than arriving at a queue that has stopped listening.
+  //
+  //     ABORTS, IT DOES NOT WAIT. `dispose()` fires the queue's AbortController first, so
+  //     a 200 MB upload sitting on a domestic uplink is cancelled rather than held open
+  //     while `before-quit` waits on it, and every clip still queued is walked out with a
+  //     visible `skipped` outcome. The clips themselves are untouched: a cancelled upload
+  //     costs the upload and nothing else.
+  try {
+    await services.uploads.dispose()
+  } catch (error) {
+    log('shutdown/uploads', error)
+  }
+
+  // 3c. And the credential check, which is the one Streamable request the queue's own
+  //     controller does not cover: it is started from `streamable:test` on behalf of the
+  //     window, so nothing else holds a handle on it.
+  try {
+    services.streamableAbort.abort()
+  } catch (error) {
+    log('shutdown/streamable', error)
   }
 
   try {

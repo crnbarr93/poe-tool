@@ -2,7 +2,7 @@
  * src/renderer/src/App.tsx
  * ========================
  *
- * The whole config window: one page, five sections, no router.
+ * The whole config window: one page, six sections, no router.
  *
  * THIS WINDOW IS OPTIONAL
  * -----------------------
@@ -21,6 +21,7 @@ import { ClipsSection } from './components/ClipsSection'
 import { EventFeedSection } from './components/EventFeedSection'
 import { LogSourceSection } from './components/LogSourceSection'
 import { ObsSection } from './components/ObsSection'
+import { StreamableSection } from './components/StreamableSection'
 import { UpdateStatus } from './components/UpdateStatus'
 import { getBridge, useSettingsController } from './hooks'
 
@@ -116,6 +117,17 @@ function ConfigApp({ api }: ConfigAppProps): ReactElement {
         />
         <ObsSection api={api} settings={settings} update={update} commit={commit} flush={flush} />
         <ClipsSection api={api} settings={settings} update={update} commit={commit} flush={flush} />
+        {/*
+          After Clips on purpose: uploading is something that happens TO a clip, and its
+          per-clip outcome is rendered on the rows in the section above.
+        */}
+        <StreamableSection
+          api={api}
+          settings={settings}
+          update={update}
+          commit={commit}
+          flush={flush}
+        />
         <EventFeedSection api={api} />
       </main>
 

@@ -139,11 +139,20 @@ const api: PoeToolApi = {
   getActiveCharacter: () => invoke(IPC_INVOKE.CHARACTER_ACTIVE),
   getCharacterSuggestions: () => invoke(IPC_INVOKE.CHARACTER_SUGGESTIONS),
   getUpdateState: () => invoke(IPC_INVOKE.UPDATE_STATE),
+  // The ONLY two members of this bridge that carry a password, and both carry it in the
+  // same direction: renderer -> main, because the user has just typed it. Nothing
+  // returned by `testStreamable` contains one (its failure `error` describes the
+  // attempt), and `getCredentialStatus` answers "is a password stored, and is it usable"
+  // with facts ABOUT a secret rather than the secret. See the password invariant in
+  // `src/shared/ipc.ts`.
+  testStreamable: (params) => invoke(IPC_INVOKE.STREAMABLE_TEST, params),
+  getCredentialStatus: () => invoke(IPC_INVOKE.CREDENTIALS_STATUS),
 
   onEvent: (listener) => subscribe(IPC_PUSH.EVENT, listener),
   onStatus: (listener) => subscribe(IPC_PUSH.STATUS, listener),
   onObsStatus: (listener) => subscribe(IPC_PUSH.OBS_STATUS, listener),
   onClip: (listener) => subscribe(IPC_PUSH.CLIP, listener),
+  onClipUpload: (listener) => subscribe(IPC_PUSH.CLIP_UPLOAD, listener),
   onCharacter: (listener) => subscribe(IPC_PUSH.CHARACTER, listener),
   onUpdate: (listener) => subscribe(IPC_PUSH.UPDATE, listener)
 }

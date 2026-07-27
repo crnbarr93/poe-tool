@@ -89,7 +89,7 @@ import type { ClipRecord } from '../../shared/ipc'
 import type { AppSettings, CharacterSettings } from '../../shared/settings'
 import { TypedEmitter } from '../events/typed-emitter'
 import type { EventListener } from '../events/typed-emitter'
-import type { MoveClipOptions } from './clip-library'
+import { newClipId, type MoveClipOptions } from './clip-library'
 import type { ObsError, ObsResult, SavedReplay } from './obs-client'
 
 // ---------------------------------------------------------------------------
@@ -814,6 +814,13 @@ export class ReplayClipper {
       // Synthesise the record ourselves: OBS really did write a file, and the user
       // needs to be told where it is even though we could not move it.
       record = {
+        // Same minting function the library uses, so a synthesised record is addressable
+        // by `push:clip-upload` exactly like a real one. `upload: 'disabled'` for the
+        // same reason it is the library's initial value - and here it is also the FINAL
+        // value, because `moved: false` means the upload queue will report `skipped`
+        // rather than attempt anything.
+        id: newClipId(),
+        upload: { state: 'disabled' },
         savedAt: when.getTime(),
         originalPath: saved.value.savedReplayPath,
         finalPath: null,

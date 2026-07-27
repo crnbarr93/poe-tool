@@ -117,7 +117,7 @@ export function EventFeedSection({ api }: EventFeedSectionProps): ReactElement {
 
   return (
     <Section
-      index="5"
+      index="6"
       title="Live events"
       description="Everything the parser has recognised, newest first. Hover a row to see the raw log line."
       aside={

@@ -13,6 +13,12 @@
  *  - {@link validateSettings} MUST NOT throw for ANY input. It is the only thing
  *    standing between a hand-edited / corrupted settings.json and a main process
  *    that fails to boot.
+ *
+ * SECRETS: this file describes the IN-MEMORY shape, in which every password is a plain
+ * string. Encryption at rest is entirely `src/main/settings/store.ts`'s job (Electron
+ * `safeStorage`, injected as an encrypt/decrypt pair), so the on-disk JSON does not
+ * match this type and nothing here knows that. Keeping the secret OUT of renderer
+ * payloads is a separate rule with its own helper - see {@link redactSecrets}.
  */
 
 // ---------------------------------------------------------------------------
@@ -125,12 +131,95 @@ export interface ClipSettings {
   readonly writeSidecar: boolean
 }
 
+/**
+ * Streamable account + auto-upload behaviour.
+ *
+ *
+ * THE PASSWORD IS A PLAIN STRING HERE, AND THAT IS DELIBERATE
+ * -----------------------------------------------------------
+ * {@link password} is the IN-MEMORY value: what the user typed, what the uploader puts
+ * in an HTTP Basic header. ENCRYPTION IS A STORE CONCERN, applied on write and reversed
+ * on read by `src/main/settings/store.ts` (Electron `safeStorage`/DPAPI, injected as an
+ * encrypt/decrypt pair - see that file's header). The persisted JSON therefore does NOT
+ * look like this type, and it is not supposed to: on disk the secret is an opaque
+ * base64 blob under a different key, and the store is the ONLY thing that knows that.
+ *
+ * The consequences, all of which someone will otherwise get wrong:
+ *  - The in-memory shape never changes. Every consumer reads `settings.streamable.password`
+ *    and gets a usable password or `""`. Nothing outside the store decrypts anything.
+ *  - {@link validateSettings} knows nothing about encryption. It coerces whatever it is
+ *    handed; the store decrypts BEFORE validating and encrypts AFTER.
+ *  - A decrypt that fails (the settings file was copied from another machine, or Windows
+ *    rotated the DPAPI key) is NOT a corrupt-settings event. The password comes back as
+ *    `""` - "you need to type it again" - and the reason is reported to the UI through
+ *    `credentials:status` in `./ipc`. Losing a password must never cost the user the
+ *    rest of their settings.
+ *
+ * THIS PASSWORD NEVER TRAVELS TO THE RENDERER. See {@link redactSecrets} and the
+ * password invariant in `./ipc`.
+ *
+ *
+ * WHY THERE IS NO API TOKEN FIELD
+ * -------------------------------
+ * Streamable has no revocable upload token. Its documented API is read-only and its
+ * upload endpoint is unofficial, authenticated with the ACCOUNT email + password. That
+ * is a real credential with real blast radius, which is why it is encrypted at rest,
+ * kept out of every renderer payload, and gated behind {@link enabled} defaulting to
+ * false. Exactly one module in `src/main/**` talks to that endpoint, and its header is
+ * where the endpoint's unofficial status is documented.
+ */
+export interface StreamableSettings {
+  /**
+   * MASTER SWITCH. `false` means poe-tool never contacts Streamable at all - no upload,
+   * no status poll, no credential check - regardless of {@link autoUpload}.
+   *
+   * DEFAULTS TO FALSE. Uploading a death clip publishes it to a third party under the
+   * user's account; that has to be an explicit opt-in, never something that starts
+   * happening because the app updated.
+   */
+  readonly enabled: boolean
+  /** Streamable account email, used as the HTTP Basic username. `""` when unconfigured. Trimmed. */
+  readonly email: string
+  /**
+   * Streamable account password, used as the HTTP Basic password. `""` when unconfigured.
+   *
+   * IN MEMORY ONLY as far as this type is concerned - the store encrypts it at rest.
+   * See the interface header. NOT trimmed: a password may legitimately begin or end
+   * with a space. Never logged, never put in an error message, never sent to the
+   * renderer.
+   */
+  readonly password: string
+  /**
+   * Upload every death clip automatically as it is filed.
+   *
+   * GATED BY {@link enabled}: `autoUpload: true` with `enabled: false` uploads nothing.
+   * Defaults to true because it is only reachable once the user has already opted in by
+   * turning {@link enabled} on; the pair exists so a user can keep their credentials
+   * configured while pausing automatic uploads.
+   */
+  readonly autoUpload: boolean
+  /**
+   * Refuse to upload a file larger than this many bytes, WITHOUT contacting Streamable.
+   *
+   * Defaults to {@link STREAMABLE_FREE_TIER_MAX_BYTES} (250 MB), the free-plan cap. The
+   * point is a specific, human error - "this clip is 380 MB; Streamable's free plan
+   * stops at 250 MB" - instead of a long upload that ends in an opaque server rejection.
+   *
+   * `0` disables the check entirely, which is also what a negative value clamps to;
+   * Streamable's own limit then does the rejecting and the failure shows up as a
+   * `failed` upload rather than a silent loss. Clamped to
+   * {@link STREAMABLE_MAX_FILE_BYTES_MIN}..{@link STREAMABLE_MAX_FILE_BYTES_MAX}.
+   */
+  readonly maxFileBytes: number
+}
+
 /** The complete persisted application configuration. */
 export interface AppSettings {
   readonly log: LogSettings
   readonly character: CharacterSettings
   readonly obs: ObsSettings
   readonly clips: ClipSettings
+  readonly streamable: StreamableSettings
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +241,29 @@ export const DEBOUNCE_MS_MAX = 60_000
 export const CHARACTER_LEVEL_MIN = 1
 /** PoE 1's level cap. `character.detectedLevel` is display-only, so clamping is cosmetic. */
 export const CHARACTER_LEVEL_MAX = 100
+
+/**
+ * Streamable's FREE-PLAN per-video size cap, in bytes (250 MB), and the default for
+ * `streamable.maxFileBytes`.
+ *
+ * The free plan also caps a video at 10 minutes and deletes it after 90 days. Neither
+ * is checkable from a file size, so neither is a setting: a replay-buffer clip is
+ * typically 30-60s, and retention is Streamable's business, not ours. This one is
+ * checkable before a single byte is sent, so it is checked.
+ *
+ * MB here is 1024-based, matching how OBS and Windows both report file sizes. If
+ * Streamable means 250 * 1000 * 1000 the difference is ~5%, and erring high only means
+ * the server rejects an upload we could have rejected first - a visible `failed`
+ * upload, not a silent one.
+ */
+export const STREAMABLE_FREE_TIER_MAX_BYTES = 250 * 1024 * 1024
+/** 0 = upload anything and let Streamable be the one to refuse it. */
+export const STREAMABLE_MAX_FILE_BYTES_MIN = 0
+/**
+ * 10 GiB. Far above anything Streamable accepts, so it is purely a sanity bound on a
+ * hand-edited or overflowed value - not a limit anyone should ever reach.
+ */
+export const STREAMABLE_MAX_FILE_BYTES_MAX = 10 * 1024 * 1024 * 1024
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -187,6 +299,16 @@ export const DEFAULT_SETTINGS: AppSettings = Object.freeze({
     libraryDir: '',
     debounceMs: 5000,
     writeSidecar: true
+  }),
+  // `enabled: false` is the important default here: uploading a death clip publishes it
+  // to a third party under the user's own account, so it may only ever happen because
+  // the user turned it on. `autoUpload: true` is only reachable once they have.
+  streamable: Object.freeze({
+    enabled: false,
+    email: '',
+    password: '',
+    autoUpload: true,
+    maxFileBytes: STREAMABLE_FREE_TIER_MAX_BYTES
   })
 })
 
@@ -395,6 +517,11 @@ export function validateSettings(input: unknown): AppSettings {
   const character = field(input, 'character')
   const obs = field(input, 'obs')
   const clips = field(input, 'clips')
+  // NOTE FOR THE STORE: by the time this sees `streamable.password` it must already be
+  // PLAINTEXT. Decryption happens on the way in and encryption on the way out, both in
+  // `src/main/settings/store.ts`; this function has no idea either exists, and a
+  // still-encrypted blob would sail through here as a perfectly valid "password".
+  const streamable = field(input, 'streamable')
 
   // MIGRATION, and it is meant to be visible to a test that reads this file.
   //
@@ -461,23 +588,87 @@ export function validateSettings(input: unknown): AppSettings {
         DEBOUNCE_MS_MAX
       ),
       writeSidecar: coerceBoolean(field(clips, 'writeSidecar'), DEFAULT_SETTINGS.clips.writeSidecar)
+    },
+    streamable: {
+      enabled: coerceBoolean(field(streamable, 'enabled'), DEFAULT_SETTINGS.streamable.enabled),
+      // Trimmed: it goes straight into an HTTP Basic header, and a trailing space from a
+      // paste would fail authentication with a message about credentials rather than
+      // about whitespace.
+      email: coerceString(field(streamable, 'email'), DEFAULT_SETTINGS.streamable.email).trim(),
+      // NOT trimmed, exactly like `obs.password` - a password may legitimately contain
+      // leading/trailing spaces, and silently altering one would produce an
+      // authentication failure nobody could explain.
+      password: coerceString(field(streamable, 'password'), DEFAULT_SETTINGS.streamable.password),
+      autoUpload: coerceBoolean(
+        field(streamable, 'autoUpload'),
+        DEFAULT_SETTINGS.streamable.autoUpload
+      ),
+      maxFileBytes: coerceInt(
+        field(streamable, 'maxFileBytes'),
+        DEFAULT_SETTINGS.streamable.maxFileBytes,
+        STREAMABLE_MAX_FILE_BYTES_MIN,
+        STREAMABLE_MAX_FILE_BYTES_MAX
+      )
     }
   }
 }
 
 /**
+ * A copy of `settings` with every SECRET blanked, for handing to the renderer.
+ *
+ * THE INVARIANT THIS EXISTS TO MAKE EXECUTABLE: a password only ever travels
+ * renderer -> main (the user typed one). Main NEVER sends one back. `settings:get` and
+ * `settings:set` both resolve with an `AppSettings`, so without this every settings
+ * round-trip would ship the Streamable account password into a web page - in an app
+ * whose repository is public and whose renderer loads real HTML.
+ *
+ * `src/main/ipc-handlers.ts` must call this on every `AppSettings` it returns or pushes.
+ * It lives here, not there, so the rule is one greppable function rather than a habit.
+ *
+ * WHAT COMES BACK: `streamable.password` is `""`. That is INDISTINGUISHABLE from "no
+ * password is configured", which is deliberate - the renderer is not entitled to know
+ * either way from this payload. It asks `credentials:status` (see `./ipc`) instead,
+ * which reports whether a secret is present and, if it went missing, why.
+ *
+ * AND THE OTHER HALF OF THE RULE, WHICH IS EASY TO MISS: because the renderer holds
+ * `""`, and `useSettingsController` sends its whole settings object back as a patch, an
+ * empty `streamable.password` in an incoming patch MUST mean "leave the stored password
+ * alone" - never "clear it". Otherwise saving an unrelated field would wipe the
+ * credential. `src/main/ipc-handlers.ts` owns that narrowing; see the note on
+ * `settings:set` in `./ipc`.
+ *
+ * `obs.password` is deliberately NOT blanked. It is a local obs-websocket password on
+ * `127.0.0.1` whose blast radius is control of the user's own OBS, it is frequently
+ * empty, and the settled config UI already round-trips and displays it. A Streamable
+ * account password is a different kind of thing: it is reusable, it is the account, and
+ * there is no revocable token to use instead.
+ */
+export function redactSecrets(settings: AppSettings): AppSettings {
+  if (settings.streamable.password === '') return settings
+  return { ...settings, streamable: { ...settings.streamable, password: '' } }
+}
+
+/**
  * Applies a {@link DeepPartial} patch to a base settings object and validates the
- * result. Shallow-merges each of the four sections, so a patch may name any subset
+ * result. Shallow-merges each of the five sections, so a patch may name any subset
  * of any section without clobbering its siblings.
  *
  * This is the exact operation behind the `settings:set` IPC call; it lives here so
  * it is unit-testable without electron.
+ *
+ * SECRETS ARE ORDINARY FIELDS TO THIS FUNCTION. A patch carrying
+ * `streamable.password: ''` really does set it to `''`, because "absent means no
+ * change" is the only patch rule here and inventing a second one ("empty also means no
+ * change") would make it impossible to express a deliberate clear. The renderer's
+ * redacted `''` is prevented from reaching here by the narrowing in
+ * `src/main/ipc-handlers.ts` - see {@link redactSecrets}.
  */
 export function applySettingsPatch(base: AppSettings, patch: DeepPartial<AppSettings>): AppSettings {
   return validateSettings({
     log: { ...base.log, ...withoutUndefined(patch.log) },
     character: { ...base.character, ...withoutUndefined(patch.character) },
     obs: { ...base.obs, ...withoutUndefined(patch.obs) },
-    clips: { ...base.clips, ...withoutUndefined(patch.clips) }
+    clips: { ...base.clips, ...withoutUndefined(patch.clips) },
+    streamable: { ...base.streamable, ...withoutUndefined(patch.streamable) }
   })
 }
