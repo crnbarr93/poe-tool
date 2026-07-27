@@ -1,0 +1,695 @@
+/**
+ * src/main/ipc-handlers.ts
+ * =======================
+ *
+ * The main-process half of the wire protocol declared in `src/shared/ipc.ts`.
+ *
+ * This is one of exactly three files allowed to import `electron` (the others being
+ * `src/main/index.ts` and - via an injected directory - `src/main/settings/store.ts`).
+ * Everything it orchestrates is electron-free and therefore unit-testable on its own.
+ *
+ *
+ * WHY THE DEPENDENCIES ARE STRUCTURAL PORTS AND NOT CONCRETE CLASSES
+ * ------------------------------------------------------------------
+ * {@link IpcHandlerDeps} names the *capabilities* this file needs - "give me the
+ * current settings", "tell me when a clip lands" - rather than importing
+ * `SettingsStore`, `EventBus`, `ObsClient`, `LogWatcher` and `ReplayClipper`. Three
+ * concrete reasons:
+ *
+ *  1. It keeps the IPC layer off the critical path's import graph. Nothing here can
+ *     accidentally reach into the tail loop's internals.
+ *  2. `src/main/index.ts` owns service construction and lifetimes. If a concrete class
+ *     shape does not line up with a port (a `getStatus()` where the port wants a
+ *     `status` getter, say), index.ts passes a three-line adapter object literal. That
+ *     adaptation belongs in the wiring file, not smeared through the handlers.
+ *  3. The real classes satisfy these ports structurally with no `implements` clause
+ *     and no runtime cost - `SettingsStore` already IS a `SettingsPort`.
+ *
+ *
+ * EVERY RENDERER PAYLOAD IS UNTRUSTED
+ * -----------------------------------
+ * `contextIsolation` and a narrow preload bridge make it hard for renderer code to
+ * send something unexpected, but "hard" is not "impossible" - a compromised renderer
+ * can call `ipcRenderer.invoke` with anything at all, and the preload's types are
+ * erased at runtime. So every handler here takes `unknown` and narrows it with the
+ * total, never-throwing helpers below before a value reaches a service. In
+ * particular `applySettingsPatch` reads `patch.log` directly and would throw a
+ * TypeError on a `null` patch, so {@link narrowSettingsPatch} runs first.
+ *
+ *
+ * NOTHING CROSSES IPC AS AN `Error`
+ * ---------------------------------
+ * Electron serialises a rejected `handle` into
+ * `Error: Error invoking remote method 'x': ...` - an opaque string with the original
+ * type, code and structure gone. Every handler therefore RESOLVES with a value from
+ * the frozen contract and reports failures either as a result union (`ObsTestResult`)
+ * or by falling back to the honest current state. Diagnostics go to
+ * {@link IpcHandlerDeps.onError}, never to the renderer.
+ *
+ *
+ * A CLOSED WINDOW MUST NOT BREAK THE TAIL LOOP
+ * --------------------------------------------
+ * The push listeners registered here run INSIDE `TypedEmitter.emit`, which
+ * deliberately propagates listener exceptions back to the emitter (see its header).
+ * The emitter is fed from the log watcher's tail loop. A `webContents.send` on a
+ * destroyed window throws `Object has been destroyed`, so an unguarded send would
+ * take down log tailing the moment the user closed the window. {@link makeSender}
+ * checks `isDestroyed()` on both the window and its webContents AND wraps the send,
+ * because the window can be torn down between the check and the call.
+ */
+
+import { ipcMain, type BrowserWindow, type IpcMainInvokeEvent } from 'electron'
+
+import type { PoeEvent, PoeEventMap, WatcherStatus } from '../shared/events'
+import {
+  IPC_INVOKE,
+  IPC_PUSH,
+  type ClipRecord,
+  type IpcInvokeChannel,
+  type IpcInvokeResult,
+  type IpcPushChannel,
+  type IpcPushPayload,
+  type ObsConnectionState,
+  type ObsTestRequest,
+  type ObsTestResult
+} from '../shared/ipc'
+import type { AppSettings, DeepPartial, ObsSettings } from '../shared/settings'
+import { PORT_MAX, PORT_MIN } from '../shared/settings'
+import { autodetectLogPath, fileExists } from './log/default-paths'
+
+// ---------------------------------------------------------------------------
+// Ring buffer sizes
+// ---------------------------------------------------------------------------
+
+/**
+ * How many `PoeEvent`s to keep for `events:recent`.
+ *
+ * The buffer exists so a window that opens (or reloads, or is re-created from the
+ * tray) mid-session renders a populated feed instead of an empty one. It is
+ * SESSION-SCOPED and starts filling the moment {@link registerIpcHandlers} runs -
+ * which index.ts must do BEFORE starting the watcher, so nothing is missed.
+ *
+ * 200 events is a few hundred KB at worst (each carries its source line) and covers
+ * far more history than the UI shows.
+ */
+export const RECENT_EVENTS_LIMIT = 200
+
+/**
+ * How many `ClipRecord`s to keep for `clips:recent`.
+ *
+ * Also session-scoped. There is deliberately no on-disk clip index: `ClipLibrary`
+ * writes optional per-clip `.json` sidecars and otherwise treats the library
+ * directory as the source of truth, and inventing a second index that could disagree
+ * with the filesystem would be worse than showing only this session's clips.
+ */
+export const RECENT_CLIPS_LIMIT = 50
+
+// ---------------------------------------------------------------------------
+// Dependency ports
+// ---------------------------------------------------------------------------
+
+/** What this file needs from `src/main/settings/store.ts`. `SettingsStore` satisfies it as-is. */
+export interface SettingsPort {
+  /** Current validated settings. Must not throw. */
+  readonly get: () => AppSettings
+  /**
+   * Applies a patch and persists it, returning the complete new settings.
+   *
+   * MAY THROW - the store is transactional and surfaces a failed disk write rather
+   * than pretending it succeeded. {@link registerIpcHandlers} catches it, because a
+   * rejected invoke would reach the renderer as an opaque string.
+   */
+  readonly save: (patch: DeepPartial<AppSettings>) => AppSettings
+}
+
+/**
+ * What this file needs from `src/main/events/event-bus.ts`.
+ *
+ * Only `on`/`off` over the frozen {@link PoeEventMap} - the IPC layer is a pure
+ * consumer of the bus and must never emit onto it. `TypedEmitter<PoeEventMap>` and
+ * anything extending it satisfy this. The return type is `unknown` so a bus that
+ * returns `this` (for chaining) and one that returns an unsubscribe function are both
+ * acceptable.
+ */
+export interface EventBusPort {
+  readonly on: <K extends keyof PoeEventMap>(
+    channel: K,
+    listener: (...args: PoeEventMap[K]) => void
+  ) => unknown
+  readonly off: <K extends keyof PoeEventMap>(
+    channel: K,
+    listener: (...args: PoeEventMap[K]) => void
+  ) => unknown
+}
+
+/** What this file needs from `src/main/obs/obs-client.ts`. `ObsClient` satisfies it as-is. */
+export interface ObsPort {
+  /** Current connection state. A stored value, not a probe - cheap to read. */
+  readonly state: ObsConnectionState
+  /** One-shot credential check on a throwaway socket. Never rejects. */
+  readonly testConnection: (config: ObsTestRequest) => Promise<ObsTestResult>
+  /** Connects (or reconnects, replacing any existing socket). Never rejects. */
+  readonly connect: (
+    config: ObsTestRequest,
+    options: { readonly autoReconnect: boolean }
+  ) => Promise<ObsConnectionState>
+  /** Closes the socket and stops the retry loop. Idempotent. Never rejects. */
+  readonly disconnect: () => Promise<void>
+  readonly on: (channel: 'state', listener: (state: ObsConnectionState) => void) => unknown
+  readonly off: (channel: 'state', listener: (state: ObsConnectionState) => void) => unknown
+}
+
+/** What this file needs from `src/main/log/log-watcher.ts`. `LogWatcher` satisfies it as-is. */
+export interface WatcherPort {
+  /** Current watcher state. A stored value, mirroring `ObsPort.state`. */
+  readonly status: WatcherStatus
+  /**
+   * Re-reads the settings store and restarts the tail if anything it cares about
+   * moved.
+   *
+   * CALLED UNCONDITIONALLY after every successful `settings:set`, so the CONTRACT is
+   * that the implementation compares first and no-ops otherwise. That is the right
+   * place for the comparison: the watcher knows that `log.path` and
+   * `log.pollIntervalMs` force a restart while `character.name` is re-read on every
+   * tick and needs none. Duplicating that knowledge here would let the two drift, and
+   * a needless restart costs the reader's carry buffer and its byte offset.
+   *
+   * Takes no arguments because the watcher already holds the same settings store this
+   * handler just wrote to - the ordering below (save, then reconfigure) is what makes
+   * that safe.
+   */
+  readonly reconfigure: () => void | Promise<void>
+}
+
+/**
+ * What this file needs from `src/main/obs/replay-clipper.ts`: notification that a clip
+ * was saved. `ReplayClipper` satisfies it as-is.
+ *
+ * Clips are NOT on the {@link PoeEventMap} bus - a `ClipRecord` is produced well
+ * downstream of a `death:self` event, after OBS and the filesystem have both had
+ * their say - so this is a second, separate subscription rather than another bus
+ * channel.
+ *
+ * Only the `clip` channel. The clipper also emits an `outcome` for every death
+ * (including the skips and failures that never produce a file), which is exactly the
+ * diagnostic firehose the frozen `push:clip` contract does not carry; index.ts can
+ * log that separately.
+ */
+export interface ClipperPort {
+  readonly on: (channel: 'clip', listener: (clip: ClipRecord) => void) => unknown
+  readonly off: (channel: 'clip', listener: (clip: ClipRecord) => void) => unknown
+}
+
+/** Everything {@link registerIpcHandlers} needs. Assembled by `src/main/index.ts`. */
+export interface IpcHandlerDeps {
+  readonly settings: SettingsPort
+  readonly bus: EventBusPort
+  readonly obs: ObsPort
+  readonly clipper: ClipperPort
+  readonly watcher: WatcherPort
+  /**
+   * The window to push to, or null/undefined when there is none.
+   *
+   * A FUNCTION, not a window: the main process outlives any particular window
+   * (close-to-tray, a renderer crash, a dev-server reload all replace it) and must
+   * keep tailing and clipping with zero windows open. Called fresh on every push so a
+   * new window starts receiving without any re-registration.
+   */
+  readonly getWindow: () => BrowserWindow | null | undefined
+  /**
+   * Diagnostic sink for everything this file swallows. Defaults to `console.error`.
+   *
+   * Purely observational - a hook that throws is itself swallowed, because a logger
+   * must never be the reason the main process dies.
+   */
+  readonly onError?: (error: unknown, context: string) => void
+}
+
+/**
+ * Removes every `ipcMain` handler and every bus/OBS/clipper listener this
+ * registration added. Idempotent; safe to call from `before-quit`.
+ */
+export type IpcTeardown = () => void
+
+// ---------------------------------------------------------------------------
+// Untrusted-payload narrowing (all pure, all total, none throw)
+// ---------------------------------------------------------------------------
+
+/** True for plain objects only - rejects `null` and arrays, both `typeof 'object'`. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Reads `key` off an unknown value, yielding `undefined` when it is not a record. */
+function field(source: unknown, key: string): unknown {
+  return isRecord(source) ? source[key] : undefined
+}
+
+/** A string, or `undefined` for anything else. `undefined` means "not present in the patch". */
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+/** A string or an explicit `null`; anything else is "not present". */
+function optionalNullableString(value: unknown): string | null | undefined {
+  if (value === null) return null
+  return typeof value === 'string' ? value : undefined
+}
+
+/**
+ * A finite number, or `undefined`.
+ *
+ * Numeric strings are accepted because `<input type="number">` hands back a string
+ * and the renderer should not have to remember to coerce. Range clamping is NOT done
+ * here - `validateSettings` owns the bounds, and duplicating them would let the two
+ * drift apart.
+ */
+function optionalNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : undefined
+  }
+  return undefined
+}
+
+/** A boolean, or the strings `"true"`/`"false"` (checkbox round-trips), else `undefined`. */
+function optionalBoolean(value: unknown): boolean | undefined {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (normalized === 'true') return true
+    if (normalized === 'false') return false
+  }
+  return undefined
+}
+
+/**
+ * Rebuilds an arbitrary renderer payload as a well-typed {@link DeepPartial} patch.
+ *
+ * Only the twelve known fields survive; everything else - extra keys, prototype
+ * pollution attempts, functions, nested junk - is dropped on the floor. A field whose
+ * value has the wrong type becomes `undefined`, which `applySettingsPatch` reads as
+ * "no change" rather than "reset to default", so a garbled patch can never silently
+ * wipe a setting the user did not touch.
+ *
+ * PURE and TOTAL: never throws, for any input including `null`, arrays and primitives.
+ */
+export function narrowSettingsPatch(raw: unknown): DeepPartial<AppSettings> {
+  const log = field(raw, 'log')
+  const character = field(raw, 'character')
+  const obs = field(raw, 'obs')
+  const clips = field(raw, 'clips')
+
+  return {
+    log: {
+      path: optionalNullableString(field(log, 'path')),
+      pollIntervalMs: optionalNumber(field(log, 'pollIntervalMs'))
+    },
+    character: {
+      name: optionalString(field(character, 'name'))
+    },
+    obs: {
+      host: optionalString(field(obs, 'host')),
+      port: optionalNumber(field(obs, 'port')),
+      password: optionalString(field(obs, 'password')),
+      autoConnect: optionalBoolean(field(obs, 'autoConnect'))
+    },
+    clips: {
+      enabled: optionalBoolean(field(clips, 'enabled')),
+      libraryDir: optionalString(field(clips, 'libraryDir')),
+      debounceMs: optionalNumber(field(clips, 'debounceMs')),
+      writeSidecar: optionalBoolean(field(clips, 'writeSidecar'))
+    }
+  }
+}
+
+/** An integer inside the valid TCP port range, else `undefined`. */
+function optionalPort(value: unknown): number | undefined {
+  const parsed = optionalNumber(value)
+  if (parsed === undefined) return undefined
+  const rounded = Math.round(parsed)
+  return rounded >= PORT_MIN && rounded <= PORT_MAX ? rounded : undefined
+}
+
+/**
+ * Rebuilds an `obs:test` payload, substituting the SAVED setting for any field the
+ * renderer omitted or sent as the wrong type.
+ *
+ * Falling back rather than rejecting is deliberate: the common shape of this call is
+ * "test what is currently in the form", and a form that has not been touched sends
+ * exactly the saved values anyway. A test against the saved credentials is a useful
+ * answer; an error about a malformed payload is not.
+ *
+ * PURE and TOTAL: never throws.
+ */
+export function narrowObsTestRequest(raw: unknown, fallback: ObsSettings): ObsTestRequest {
+  return {
+    host: optionalString(field(raw, 'host')) ?? fallback.host,
+    port: optionalPort(field(raw, 'port')) ?? fallback.port,
+    password: optionalString(field(raw, 'password')) ?? fallback.password
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
+/**
+ * The shape of an `ipcMain.handle` listener for one channel.
+ *
+ * `args` is `unknown[]`, NOT the contract's argument tuple: what actually arrives is
+ * whatever the renderer sent. The tuple type describes what a well-behaved renderer
+ * sends; the handler body is responsible for turning `unknown` into that.
+ */
+type InvokeHandler<C extends IpcInvokeChannel> = (
+  event: IpcMainInvokeEvent,
+  ...args: unknown[]
+) => IpcInvokeResult<C> | Promise<IpcInvokeResult<C>>
+
+/**
+ * Wires every channel in `src/shared/ipc.ts` and starts forwarding bus, OBS and clip
+ * activity to the renderer.
+ *
+ * Call ONCE during bootstrap, BEFORE starting the log watcher, so the recent-events
+ * ring buffer does not miss the first lines.
+ *
+ * @returns a teardown that removes everything it registered.
+ */
+export function registerIpcHandlers(deps: IpcHandlerDeps): IpcTeardown {
+  const report = makeReporter(deps.onError)
+  const send = makeSender(deps.getWindow, report)
+
+  /** Newest-LAST, matching the `events:recent` contract. */
+  const recentEvents: PoeEvent[] = []
+  /** Newest-FIRST, matching the `clips:recent` contract. */
+  const recentClips: ClipRecord[] = []
+
+  let disposed = false
+
+  // -------------------------------------------------------------------------
+  // Invoke channels
+  // -------------------------------------------------------------------------
+
+  const registered: IpcInvokeChannel[] = []
+
+  /**
+   * Registers one handler.
+   *
+   * `removeHandler` first because `ipcMain.handle` THROWS on a duplicate channel, and
+   * a dev-mode reload that re-runs bootstrap without a clean teardown would otherwise
+   * take the main process down on startup.
+   */
+  const register = <C extends IpcInvokeChannel>(channel: C, handler: InvokeHandler<C>): void => {
+    ipcMain.removeHandler(channel)
+    ipcMain.handle(channel, handler)
+    registered.push(channel)
+  }
+
+  register(IPC_INVOKE.SETTINGS_GET, () => deps.settings.get())
+
+  register(IPC_INVOKE.SETTINGS_SET, (_event, ...args) => {
+    const previous = deps.settings.get()
+    const patch = narrowSettingsPatch(args[0])
+
+    let next: AppSettings
+    try {
+      next = deps.settings.save(patch)
+    } catch (error) {
+      // The store writes to disk BEFORE swapping its in-memory value, so a failed
+      // save leaves memory and disk agreeing on the old settings. Returning that old
+      // value is therefore honest rather than a guess: the UI re-renders what is
+      // actually in effect, and the user sees their edit revert instead of believing
+      // a change took hold that did not.
+      report(error, 'settings:set/save')
+      return deps.settings.get()
+    }
+
+    reconfigure(deps, previous, next, report)
+    return next
+  })
+
+  register(IPC_INVOKE.OBS_TEST, async (_event, ...args) => {
+    const request = narrowObsTestRequest(args[0], deps.settings.get().obs)
+    try {
+      return await deps.obs.testConnection(request)
+    } catch (error) {
+      // `testConnection` is documented as never throwing; this is the belt to that
+      // braces. A "Test connection" button must always get an answer it can render.
+      report(error, 'obs:test')
+      return { ok: false, error: describeUnexpected(error) }
+    }
+  })
+
+  register(IPC_INVOKE.OBS_STATUS, () => deps.obs.state)
+
+  register(IPC_INVOKE.LOG_AUTODETECT, async () => {
+    try {
+      return { candidates: await autodetectLogPath(process.env, fileExists) }
+    } catch (error) {
+      // `autodetectLogPath` swallows per-candidate failures already. An empty list is
+      // the documented "nothing found, ask the user to browse" outcome, which is also
+      // the right thing to say when the scan itself fell over.
+      report(error, 'log:autodetect')
+      return { candidates: [] }
+    }
+  })
+
+  register(IPC_INVOKE.LOG_STATUS, () => deps.watcher.status)
+
+  // `slice()` so a renderer-side mutation (or a later push) cannot reach into the
+  // live buffer. The events themselves are deeply readonly value objects.
+  register(IPC_INVOKE.EVENTS_RECENT, () => recentEvents.slice())
+  register(IPC_INVOKE.CLIPS_RECENT, () => recentClips.slice())
+
+  // -------------------------------------------------------------------------
+  // Push channels
+  // -------------------------------------------------------------------------
+
+  // These four run inside the emitters they subscribe to, on the critical path.
+  // Nothing in them may throw: `send` swallows, and the ring-buffer writes cannot
+  // fail.
+
+  const onBusEvent = (event: PoeEvent): void => {
+    if (disposed) return
+    recentEvents.push(event)
+    if (recentEvents.length > RECENT_EVENTS_LIMIT) {
+      recentEvents.splice(0, recentEvents.length - RECENT_EVENTS_LIMIT)
+    }
+    send(IPC_PUSH.EVENT, event)
+  }
+
+  const onBusStatus = (status: WatcherStatus): void => {
+    if (disposed) return
+    send(IPC_PUSH.STATUS, status)
+  }
+
+  const onObsState = (state: ObsConnectionState): void => {
+    if (disposed) return
+    send(IPC_PUSH.OBS_STATUS, state)
+  }
+
+  const onClipSaved = (clip: ClipRecord): void => {
+    if (disposed) return
+    recentClips.unshift(clip)
+    if (recentClips.length > RECENT_CLIPS_LIMIT) {
+      recentClips.length = RECENT_CLIPS_LIMIT
+    }
+    send(IPC_PUSH.CLIP, clip)
+  }
+
+  // Subscribing to `event` (rather than to each of `zone-entered`/`area-generated`/
+  // `death`) is what makes this exactly-once: the bus fans every PoeEvent out on
+  // `event` IN ADDITION to its per-type channel, so listening to both would show the
+  // user every death twice.
+  deps.bus.on('event', onBusEvent)
+  deps.bus.on('watcher-status', onBusStatus)
+  deps.obs.on('state', onObsState)
+  deps.clipper.on('clip', onClipSaved)
+
+  // -------------------------------------------------------------------------
+  // Teardown
+  // -------------------------------------------------------------------------
+
+  return (): void => {
+    if (disposed) return
+    disposed = true
+
+    for (const channel of registered) {
+      try {
+        ipcMain.removeHandler(channel)
+      } catch (error) {
+        report(error, `teardown:${channel}`)
+      }
+    }
+    registered.length = 0
+
+    try {
+      deps.bus.off('event', onBusEvent)
+      deps.bus.off('watcher-status', onBusStatus)
+    } catch (error) {
+      report(error, 'teardown:bus')
+    }
+
+    try {
+      deps.obs.off('state', onObsState)
+    } catch (error) {
+      report(error, 'teardown:obs')
+    }
+
+    try {
+      deps.clipper.off('clip', onClipSaved)
+    } catch (error) {
+      report(error, 'teardown:clipper')
+    }
+
+    recentEvents.length = 0
+    recentClips.length = 0
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live reconfiguration
+// ---------------------------------------------------------------------------
+
+/**
+ * Applies the side effects of a settings change to the running services.
+ *
+ * FIRE-AND-FORGET BY DESIGN. A reconnect can sit for the full 10s connect timeout,
+ * and blocking `settings:set` on it would freeze the settings form on every keystroke
+ * that touches a connection field. The renderer learns the outcome from the
+ * `push:obs-status` / `push:status` streams instead, which is where it was always
+ * going to have to watch for it.
+ *
+ * COMPARISONS ARE AGAINST THE VALIDATED `next`, NOT THE RAW PATCH. `validateSettings`
+ * clamps and coerces, so a patch that sets `port` to `"4455"` or `0` produces a
+ * `next.obs.port` that may well equal the previous one. Diffing the validated values
+ * means such a no-op does not tear down a healthy OBS connection.
+ *
+ * The watcher gets no diff at all - see {@link WatcherPort.reconfigure} for why the
+ * comparison belongs on its side.
+ */
+function reconfigure(
+  deps: IpcHandlerDeps,
+  previous: AppSettings,
+  next: AppSettings,
+  report: (error: unknown, context: string) => void
+): void {
+  try {
+    void Promise.resolve(deps.watcher.reconfigure()).catch((error: unknown) => {
+      report(error, 'reconfigure:watcher')
+    })
+  } catch (error) {
+    // A synchronous throw from a `void`-returning implementation never reaches the
+    // `.catch` above, so it needs its own guard.
+    report(error, 'reconfigure:watcher')
+  }
+
+  const connectionChanged =
+    previous.obs.host !== next.obs.host ||
+    previous.obs.port !== next.obs.port ||
+    previous.obs.password !== next.obs.password
+  const autoConnectChanged = previous.obs.autoConnect !== next.obs.autoConnect
+
+  if (!connectionChanged && !autoConnectChanged) return
+
+  // `obs.autoConnect` is the effective on/off switch for the live connection: the
+  // frozen IPC contract has no manual "connect now" channel (only the throwaway
+  // `obs:test`), so with it off there is no way back to a connected state anyway.
+  // Turning it off therefore means "disconnect", and a credential change while it is
+  // off means "drop the socket that is now using stale credentials".
+  if (next.obs.autoConnect) {
+    try {
+      void deps.obs
+        .connect(
+          { host: next.obs.host, port: next.obs.port, password: next.obs.password },
+          { autoReconnect: true }
+        )
+        .catch((error: unknown) => {
+          report(error, 'reconfigure:obs-connect')
+        })
+    } catch (error) {
+      report(error, 'reconfigure:obs-connect')
+    }
+    return
+  }
+
+  try {
+    void deps.obs.disconnect().catch((error: unknown) => {
+      report(error, 'reconfigure:obs-disconnect')
+    })
+  } catch (error) {
+    report(error, 'reconfigure:obs-disconnect')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Wraps the diagnostic hook so a throwing logger cannot escape. */
+function makeReporter(
+  onError: ((error: unknown, context: string) => void) | undefined
+): (error: unknown, context: string) => void {
+  const sink =
+    onError ??
+    ((error: unknown, context: string): void => {
+      console.error(`[ipc] ${context}`, error)
+    })
+
+  return (error: unknown, context: string): void => {
+    try {
+      sink(error, context)
+    } catch {
+      // A logger must never be the thing that crashes the main process.
+    }
+  }
+}
+
+/**
+ * Builds the typed, window-safe push function.
+ *
+ * The channel/payload pairing is enforced by {@link IpcPushPayload}, so a `ClipRecord`
+ * cannot be sent down `push:status`.
+ *
+ * Three separate guards, all necessary:
+ *  - no window at all (closed to tray, or not created yet),
+ *  - `win.isDestroyed()` - reading `.webContents` off a destroyed window throws,
+ *  - `webContents.isDestroyed()` - a crashed or navigating renderer can leave the
+ *    window alive with dead contents.
+ * The surrounding try/catch covers the gap between the last check and the send, which
+ * is genuinely reachable: window teardown is driven by native events that can land
+ * between two statements.
+ */
+function makeSender(
+  getWindow: () => BrowserWindow | null | undefined,
+  report: (error: unknown, context: string) => void
+): <C extends IpcPushChannel>(channel: C, payload: IpcPushPayload<C>) => void {
+  return <C extends IpcPushChannel>(channel: C, payload: IpcPushPayload<C>): void => {
+    try {
+      const win = getWindow()
+      if (win === null || win === undefined || win.isDestroyed()) return
+      const contents = win.webContents
+      if (contents.isDestroyed()) return
+      contents.send(channel, payload)
+    } catch (error) {
+      report(error, `send:${channel}`)
+    }
+  }
+}
+
+/**
+ * A renderable sentence for a value that was never supposed to be thrown.
+ *
+ * Deliberately message-only: a stack trace is diagnostic noise in a settings dialog,
+ * and `ObsTestFailure.error` is documented as safe to render verbatim.
+ */
+function describeUnexpected(error: unknown): string {
+  let detail = ''
+  if (error instanceof Error) detail = error.message
+  else if (typeof error === 'string') detail = error
+
+  return detail.trim() === ''
+    ? 'The OBS connection test failed for an unknown reason.'
+    : `The OBS connection test failed: ${detail.trim()}`
+}

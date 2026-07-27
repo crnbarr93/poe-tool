@@ -1,0 +1,12 @@
+2026/07/26 19:26:18 1018399102 1186a8a3 [DEBUG Client 50396] Renderer initialised: D3D11 feature level 11_0
+2026/07/26 19:26:19 1018400244 1186a8a3 [DEBUG Client 50396] Loading texture "Art/Textures/Interface/2DItems/Currency/CurrencyRerollRare.dds"
+2026/07/26 19:26:20 1018401876 1186a8a3 [DEBUG Client 50396] Compiled shader ShadowMapDepth variant 3 in 41 ms
+2026/07/26 19:26:31 1018412156 cffb0658 [INFO Client 50396] : FyascoWorbinTime has been slain.
+2026/07/26 19:26:35 1018416002 cffb0658 [INFO Client 50396] : PartyHealerBot has been slain.
+2026/07/26 19:26:40 1018421337 cffb0658 [INFO Client 50396] TrollMcSpoof: FyascoWorbinTime has been slain.
+2026/07/26 19:28:41 1018542484 1186a8a3 [DEBUG Client 50396] Generating level 69 area "2_11_endgame_town" with seed 1
+2026/07/26 19:28:42 1018543171 cffb0658 [INFO Client 50396] : You have entered Karui Shores.
+2026/07/26 19:29:02 1018563900 1186a8a3 [DEBUG Client 50396] Generating level 68 area "MapWorldsSpiderForest" with seed 2145678123
+2026/07/26 19:29:03 1018564511 cffb0658 [INFO Client 50396] : You have entered Épreuve du Chaos.
+2026/07/26 19:29:10 1018571002 1186a8a3 [DEBUG Client 50396] Async connecting to 12.34.56.78:6112
+2026/07/26 19:29:12 1018573210 cffb0658 [INFO Client 50396] TrollMcSpoof: You have entered Karui Shores.

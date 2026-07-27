@@ -1,0 +1,879 @@
+/**
+ * src/main/tools/tail-debug.ts
+ * ============================
+ *
+ * `npm run tail:debug` - the CLI the user points at their REAL Client.txt to find
+ * out whether the regexes in `../log/patterns.ts` actually match anything.
+ *
+ * This is the tool that comes FIRST. Every other consumer in the project (event
+ * bus, zone tracker, replay clipper, UI) is downstream of `parseLine`, so a
+ * pattern that is subtly wrong silently produces an app that does nothing. The
+ * only honest way to find that out is to run the real parser over a real log and
+ * print, line by line, what it decided - plus, crucially, a SUMMARY of the lines
+ * it decided nothing about. The five most common unmatched line SHAPES are the
+ * whole point of the summary: they are the list of patterns that are missing.
+ *
+ *
+ * RULES FOR THIS FILE
+ * -------------------
+ *  - NO `electron`. It compiles under `tsconfig.tools.json`, which only includes
+ *    `src/shared/**`, `src/main/log/**`, `src/main/events/**` and
+ *    `src/main/tools/**` - trees that are guaranteed electron-free. It runs as
+ *    plain CommonJS under `node dist-tools/main/tools/tail-debug.js`.
+ *  - NO NEW DEPENDENCIES. The dependency set is frozen, so argument parsing is
+ *    hand-rolled and colour is four hand-written ANSI escapes.
+ *  - NO `any`, no `@ts-ignore`, no type assertions.
+ *  - READ ONLY. It opens the log with `LogReader`, which uses `fs.open(path,
+ *    'r')` and nothing else. Nothing in this process can write to Client.txt.
+ *
+ *
+ * WHY IT DRIVES `LogReader` DIRECTLY RATHER THAN `LogWatcher`
+ * ----------------------------------------------------------
+ * The watcher exists to turn a file into a *live event stream* with a fixed poll
+ * interval and a startup `seekToEnd()`. This tool needs the opposite of most of
+ * that: start at offset 0, drain the whole file as fast as the disk allows, stop
+ * at exactly N lines, and optionally never follow at all. Driving the reader
+ * directly keeps the debug tool's control flow explicit and - more importantly -
+ * keeps it usable as a diagnostic even if the watcher itself is what is broken.
+ *
+ * It still exercises the two pieces whose correctness is actually in question:
+ * `LogReader` (offsets, CRLF, UTF-8 across chunk boundaries) and `parseLine`
+ * (the patterns). Those are the layers a wrong answer would come from.
+ */
+
+import { resolve as resolvePath } from 'node:path'
+
+import type { ParseResult, PoeEvent, PoeEventType } from '../../shared/events'
+import { DEFAULT_SETTINGS } from '../../shared/settings'
+import { autodetectLogPath, candidateLogPaths, fileExists } from '../log/default-paths'
+import { DEFAULT_MAX_BYTES_PER_READ, LogReader } from '../log/log-reader'
+import type { LogReadResult, LogReadStatus } from '../log/log-reader'
+import { parseLine } from '../log/parse-line'
+
+// ---------------------------------------------------------------------------
+// Event type registry
+// ---------------------------------------------------------------------------
+
+/**
+ * The event types `--filter` accepts, in the order the summary lists them.
+ *
+ * Kept in lockstep with {@link PoeEventType} in BOTH directions, at compile time
+ * and with no assertions:
+ *  - `satisfies` proves every entry here is a real event type (list ⊆ union),
+ *  - {@link AssertNever} below proves no event type is missing (union ⊆ list).
+ *
+ * Adding a fourth event to the union therefore breaks this file loudly instead
+ * of silently omitting the new type from `--filter` and from the summary - which
+ * is exactly the class of bug this tool exists to expose in the first place.
+ */
+const EVENT_TYPES = ['death', 'zone-entered', 'area-generated'] as const satisfies readonly PoeEventType[]
+
+/** Compiles only when `T` is `never`. Purely a type-level assertion; no runtime cost. */
+type AssertNever<T extends never> = T
+/** Fails to compile if a {@link PoeEventType} is missing from {@link EVENT_TYPES}. */
+type _AllEventTypesListed = AssertNever<Exclude<PoeEventType, (typeof EVENT_TYPES)[number]>>
+
+/** Narrows an arbitrary `--filter` value to a real event type. */
+function isEventType(value: string): value is PoeEventType {
+  return EVENT_TYPES.some((type) => type === value)
+}
+
+// ---------------------------------------------------------------------------
+// Options
+// ---------------------------------------------------------------------------
+
+/** A fully resolved, validated command line. */
+interface CliOptions {
+  /** Explicit `--path`, already made absolute. `null` means "autodetect". */
+  readonly path: string | null
+  /** `--replay`: start at offset 0 instead of at the end of the file. */
+  readonly replay: boolean
+  /** Keep polling after the initial read drains. Defaults to `!replay`. */
+  readonly follow: boolean
+  /** `--filter`: print only this event type. `null` means "print everything". */
+  readonly filter: PoeEventType | null
+  /** `--unmatched-only`: print only lines no pattern claimed. */
+  readonly unmatchedOnly: boolean
+  /** `--char`: character name for `isSelf` tagging. `''` means unconfigured. */
+  readonly charName: string
+  /** `--limit`: stop after this many input lines. `null` means "no limit". */
+  readonly limit: number | null
+}
+
+/** Argument parsing either succeeds, asks for help, or fails with a message. */
+type ArgvResult =
+  | { readonly kind: 'options'; readonly options: CliOptions }
+  | { readonly kind: 'help' }
+  | { readonly kind: 'error'; readonly message: string }
+
+/** Flags that consume a value, either as `--flag=value` or `--flag value`. */
+const VALUE_FLAGS = ['--path', '--filter', '--char', '--limit'] as const
+/** Flags that are simply present or absent. */
+const BOOLEAN_FLAGS = ['--replay', '--follow', '--unmatched-only', '--help', '-h'] as const
+
+/**
+ * Hand-rolled argument parser. No dependencies, and no silent tolerance: an
+ * unknown flag, a missing value or a bare positional argument is an error, not
+ * something to ignore. A typo'd `--unmatchedonly` that quietly did nothing would
+ * make the user distrust the tool's OUTPUT, which is the one thing that has to be
+ * trustworthy here.
+ *
+ * @param argv Usually `process.argv.slice(2)`. Injected so this stays testable.
+ */
+function parseArgv(argv: readonly string[]): ArgvResult {
+  let path: string | null = null
+  let replay = false
+  let followFlag = false
+  let filter: PoeEventType | null = null
+  let unmatchedOnly = false
+  let charName = ''
+  let limit: number | null = null
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index]
+    // `noUncheckedIndexedAccess` makes this `string | undefined`. Unreachable
+    // inside the loop bounds, but narrowing it costs one line and no assertion.
+    if (arg === undefined) continue
+
+    // `npm run x -- -- --flag` can leak a bare separator through. Harmless.
+    if (arg === '--') continue
+
+    // Split `--flag=value` once; a value containing `=` (a Windows path never
+    // does, but a character name might) keeps everything after the FIRST `=`.
+    const equals = arg.indexOf('=')
+    const name = equals === -1 ? arg : arg.slice(0, equals)
+    const inlineValue = equals === -1 ? null : arg.slice(equals + 1)
+
+    const isValueFlag = VALUE_FLAGS.some((flag) => flag === name)
+    const isBooleanFlag = BOOLEAN_FLAGS.some((flag) => flag === name)
+
+    if (!isValueFlag && !isBooleanFlag) {
+      return arg.startsWith('-')
+        ? { kind: 'error', message: `unknown option "${arg}"` }
+        : { kind: 'error', message: `unexpected argument "${arg}" (every option starts with --)` }
+    }
+
+    if (isBooleanFlag && inlineValue !== null) {
+      return { kind: 'error', message: `option "${name}" does not take a value` }
+    }
+
+    // Resolve the value for value-flags: inline `=` form first, then the
+    // following argv entry. A following entry that looks like a flag is treated
+    // as a missing value rather than swallowed - `--path --replay` is a mistake,
+    // not a request to open a file called "--replay".
+    let value = ''
+    if (isValueFlag) {
+      if (inlineValue !== null) {
+        value = inlineValue
+      } else {
+        const next = argv[index + 1]
+        if (next === undefined || next.startsWith('-')) {
+          return { kind: 'error', message: `option "${name}" requires a value (use ${name}=<value>)` }
+        }
+        value = next
+        index += 1
+      }
+    }
+
+    switch (name) {
+      case '--help':
+      case '-h':
+        return { kind: 'help' }
+
+      case '--replay':
+        replay = true
+        break
+
+      case '--follow':
+        followFlag = true
+        break
+
+      case '--unmatched-only':
+        unmatchedOnly = true
+        break
+
+      case '--path': {
+        if (value.trim() === '') return { kind: 'error', message: '--path requires a non-empty file path' }
+        // Native `resolve`, not `win32.resolve`: --path is whatever this machine
+        // uses. (Autodetect is the Windows-specific half, and it lives in
+        // default-paths.ts where win32 is used deliberately.)
+        path = resolvePath(value)
+        break
+      }
+
+      case '--filter': {
+        if (!isEventType(value)) {
+          return {
+            kind: 'error',
+            message: `--filter must be one of: ${EVENT_TYPES.join(', ')} (got "${value}")`
+          }
+        }
+        filter = value
+        break
+      }
+
+      case '--char':
+        // Not trimmed to empty-as-error: an empty --char is a legitimate way to
+        // say "I have not configured a character", and parseLine already treats
+        // that as "isSelf is always false".
+        charName = value
+        break
+
+      case '--limit': {
+        const parsed = Number(value)
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          return { kind: 'error', message: `--limit must be a positive whole number (got "${value}")` }
+        }
+        limit = parsed
+        break
+      }
+
+      default:
+        // Unreachable: `name` was checked against both flag lists above. Kept as
+        // a total switch rather than an assertion so adding a flag to a list but
+        // forgetting the case here degrades to a clear error, not a silent no-op.
+        return { kind: 'error', message: `unhandled option "${name}"` }
+    }
+  }
+
+  if (filter !== null && unmatchedOnly) {
+    return {
+      kind: 'error',
+      message: '--filter and --unmatched-only are mutually exclusive (nothing would ever print)'
+    }
+  }
+
+  return {
+    kind: 'options',
+    options: {
+      path,
+      replay,
+      // --follow is only meaningful alongside --replay; without --replay we are
+      // already tailing live and following is the only sensible behaviour.
+      follow: replay ? followFlag : true,
+      filter,
+      unmatchedOnly,
+      charName,
+      limit
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Usage
+// ---------------------------------------------------------------------------
+
+const USAGE = `poe-tool tail:debug - read-only Client.txt pattern verifier
+
+USAGE
+  npm run tail:debug -- [options]
+
+OPTIONS
+  --path=<file>     Path to Client.txt. Omit to autodetect a Windows install.
+  --replay          Read the whole existing file from offset 0 instead of
+                    tailing from the end. This is how you check the patterns
+                    against your history.
+  --follow          Keep tailing after --replay drains. Already the default
+                    when --replay is not given.
+  --filter=<type>   Print only this event type: ${EVENT_TYPES.join(', ')}.
+                    Cannot be combined with --unmatched-only.
+  --unmatched-only  Print only lines that matched no pattern.
+  --char=<name>     Your character name, used to tag deaths with isSelf.
+                    Unset means isSelf is always false.
+  --limit=<n>       Stop after reading n lines. Useful with --replay.
+  -h, --help        Show this text.
+
+OUTPUT
+  MATCH      <type>  <json>   a recognised event
+  UNMATCHED  <raw line>       a line no pattern claimed
+
+  --filter and --unmatched-only change what is PRINTED, never what is COUNTED:
+  the closing SUMMARY always describes every line that was read.
+
+EXAMPLES
+  npm run tail:debug -- --replay --limit=5000 --char=FyascoWorbinTime
+  npm run tail:debug -- --replay --unmatched-only --limit=20000
+  npm run tail:debug -- --path="C:\\Games\\PoE\\logs\\Client.txt" --filter=death
+
+NOTES
+  The log file is opened READ ONLY. This tool never writes to it.
+  Ctrl-C prints the summary and exits cleanly.`
+
+// ---------------------------------------------------------------------------
+// Colour
+// ---------------------------------------------------------------------------
+
+/** Wraps text in an ANSI SGR sequence, or returns it untouched. */
+type Paint = (text: string) => string
+
+/** The four-ish colours this tool uses. Deliberately restrained. */
+interface Palette {
+  readonly match: Paint
+  readonly unmatched: Paint
+  readonly type: Paint
+  readonly raw: Paint
+  readonly note: Paint
+  readonly head: Paint
+  readonly strong: Paint
+}
+
+/**
+ * Builds a palette. When `colour` is false every entry is the identity function,
+ * so the exact same code path produces clean, pipe-safe text - there is no
+ * second, untested "plain" formatter to drift out of sync.
+ *
+ * Gated on `process.stdout.isTTY` by the caller: escape codes in a redirected
+ * file or a `| grep` pipeline are noise at best and break `grep` at worst.
+ */
+function makePalette(colour: boolean): Palette {
+  const wrap = (code: string): Paint =>
+    colour ? (text: string): string => `\u001b[${code}m${text}\u001b[0m` : (text: string): string => text
+
+  return {
+    match: wrap('1;32'), // bold green
+    unmatched: wrap('33'), // yellow
+    type: wrap('36'), // cyan
+    raw: wrap('90'), // bright black / grey
+    note: wrap('35'), // magenta
+    head: wrap('1;4'), // bold underline
+    strong: wrap('1') // bold
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Line formatting
+// ---------------------------------------------------------------------------
+
+/** Two-digit zero pad for the timestamp echo. */
+function pad2(value: number): string {
+  return String(value).padStart(2, '0')
+}
+
+/**
+ * Re-renders the parsed `Date` back into the log's own `YYYY/MM/DD HH:MM:SS`
+ * form.
+ *
+ * Deliberately reconstructed from the `Date` rather than echoed from the raw
+ * line: if the local-time parsing in `parse-line.ts` were ever wrong (a UTC
+ * misreading, an off-by-one month), the printed stamp would visibly disagree with
+ * the raw line next to it. Echoing the source string would hide exactly that bug.
+ */
+function formatStamp(date: Date): string {
+  const day = `${date.getFullYear()}/${pad2(date.getMonth() + 1)}/${pad2(date.getDate())}`
+  const time = `${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`
+  return `${day} ${time}`
+}
+
+/** The JSON-serialisable value types this tool prints. Never `any`. */
+type FieldValue = string | number | boolean
+
+/**
+ * The interesting fields of an event, for the compact JSON on a MATCH line.
+ *
+ * `meta` is omitted (it is the raw line plus the envelope, both of which the user
+ * can already see) and `detectedAt` is omitted (it is wall-clock noise that
+ * changes every run and would make output diffs useless). What is left is the
+ * decoded payload plus the re-rendered timestamp - i.e. everything the patterns
+ * actually claim to have extracted.
+ */
+function eventFields(event: PoeEvent): Record<string, FieldValue> {
+  const at = formatStamp(event.meta.timestamp)
+
+  switch (event.type) {
+    case 'death':
+      return { at, characterName: event.characterName, isSelf: event.isSelf }
+    case 'zone-entered':
+      return { at, zoneName: event.zoneName }
+    case 'area-generated':
+      return { at, areaLevel: event.areaLevel, areaId: event.areaId, seed: event.seed }
+    default: {
+      // Unreachable while the union is exhausted; adding a variant breaks here.
+      const exhaustive: never = event
+      return { at, unhandled: String(exhaustive) }
+    }
+  }
+}
+
+/** `MATCH  <type>  <compact json>`, padded so the JSON columns line up. */
+function formatMatch(event: PoeEvent, palette: Palette): string {
+  const fields: Record<string, FieldValue> = eventFields(event)
+  // `backlog` is a real event field and it changes what production consumers do
+  // (the clipper early-returns on it), so it is shown - but only when true, to
+  // keep the common live-tail case free of a constant `"backlog":false`.
+  if (event.backlog) fields['backlog'] = true
+
+  const label = palette.match('MATCH')
+  const type = palette.type(event.type.padEnd(14))
+  return `${label}  ${type}  ${JSON.stringify(fields)}`
+}
+
+/** `UNMATCHED  <raw line>`. */
+function formatUnmatched(raw: string, palette: Palette): string {
+  return `${palette.unmatched('UNMATCHED')}  ${palette.raw(raw)}`
+}
+
+// ---------------------------------------------------------------------------
+// Unmatched line shapes
+// ---------------------------------------------------------------------------
+
+/** Longest shape rendered in the summary before it gets an ellipsis. */
+const MAX_SHAPE_LENGTH = 110
+
+/** Quoted strings collapse first, so digits inside them never leak into the shape. */
+const QUOTED_STRING = /"[^"]*"/g
+/** A RUN of digits collapses to a single `#`: `1018412156` and `3` group together. */
+const DIGIT_RUN = /\d+/g
+
+/**
+ * Collapses the variable parts of a line so that lines which differ only in their
+ * data group into one bucket.
+ *
+ * ```text
+ * Loading texture "Art/Textures/Interface/2DItems/Currency/Chaos.dds"
+ * Loading texture "Art/Textures/Interface/2DItems/Currency/Alch.dds"
+ *   -> Loading texture "..."                                    (count 2)
+ *
+ * Compiled shader ShadowMapDepth variant 3 in 41 ms
+ *   -> Compiled shader ShadowMapDepth variant # in # ms
+ * ```
+ *
+ * Without this, the top-5 list on a real 100MB Client.txt would be five different
+ * texture paths and would tell the user nothing. With it, the list is a ranked
+ * inventory of the MESSAGE KINDS that no pattern claims - which is precisely the
+ * shopping list for the next regex.
+ */
+function normaliseShape(text: string): string {
+  return text.replace(QUOTED_STRING, '"..."').replace(DIGIT_RUN, '#')
+}
+
+/**
+ * The grouping key for one unmatched line.
+ *
+ * Shapes the BODY, not the whole raw line: the envelope's timestamp, clientMs,
+ * thread tag and pid are pure noise that would otherwise dominate every shape.
+ * The level and the system marker ARE kept, because "is this a DEBUG line or an
+ * engine message" is the first question you ask about a candidate pattern - and
+ * whether the marker is present decides whether a new pattern may be gated on it.
+ *
+ * A line whose ENVELOPE failed to parse has no body to shape, so the whole raw
+ * line is shaped instead and flagged: those are truncated partial writes or
+ * non-log content, and they mean something different from "unknown message".
+ */
+function shapeOf(result: ParseResult): string {
+  if (result.type !== 'unmatched') return ''
+  if (result.meta === null) return `<no envelope>  ${normaliseShape(result.raw)}`
+
+  const marker = result.meta.isSystemMessage ? ' :' : ''
+  const shape = `[${result.meta.level}]${marker} ${normaliseShape(result.meta.body)}`
+  return shape.length > MAX_SHAPE_LENGTH ? `${shape.slice(0, MAX_SHAPE_LENGTH)}...` : shape
+}
+
+// ---------------------------------------------------------------------------
+// Statistics
+// ---------------------------------------------------------------------------
+
+/** Everything the closing summary reports. Counts EVERY line, regardless of filters. */
+interface Stats {
+  /** Input lines read and parsed. */
+  totalLines: number
+  /** Per-event-type match counts. Zeros are reported too - a zero is a finding. */
+  readonly matched: Record<PoeEventType, number>
+  /** Lines that parsed but matched no event pattern. */
+  unmatched: number
+  /** Subset of `unmatched` whose envelope itself failed - truncated/non-log lines. */
+  envelopeFailures: number
+  /** Shape -> occurrences. Insertion-ordered, which gives a stable tie-break. */
+  readonly shapes: Map<string, number>
+}
+
+function newStats(): Stats {
+  return {
+    totalLines: 0,
+    // Object literal, not a loop over EVENT_TYPES: this is what makes TypeScript
+    // enforce that every PoeEventType has a counter, with no assertion.
+    matched: { death: 0, 'zone-entered': 0, 'area-generated': 0 },
+    unmatched: 0,
+    envelopeFailures: 0,
+    shapes: new Map<string, number>()
+  }
+}
+
+function record(stats: Stats, result: ParseResult): void {
+  stats.totalLines += 1
+
+  if (result.type !== 'unmatched') {
+    stats.matched[result.type] += 1
+    return
+  }
+
+  stats.unmatched += 1
+  if (result.meta === null) stats.envelopeFailures += 1
+
+  const shape = shapeOf(result)
+  stats.shapes.set(shape, (stats.shapes.get(shape) ?? 0) + 1)
+}
+
+/**
+ * The N most common shapes, most common first.
+ *
+ * Ties break by first appearance, because `Map` preserves insertion order and
+ * `Array.prototype.sort` is stable - so two runs over the same file always print
+ * the same list in the same order.
+ */
+function topShapes(shapes: ReadonlyMap<string, number>, n: number): Array<readonly [string, number]> {
+  return [...shapes.entries()].sort((a, b) => b[1] - a[1]).slice(0, n)
+}
+
+/** How many unmatched shapes the summary lists. */
+const TOP_SHAPE_COUNT = 5
+
+// ---------------------------------------------------------------------------
+// Output
+// ---------------------------------------------------------------------------
+
+/** One line to stdout. */
+function write(line: string): void {
+  process.stdout.write(`${line}\n`)
+}
+
+/** Extracts a `node:fs`-style `error.code` from an unknown value. */
+function errorCodeOf(error: unknown): string | null {
+  if (typeof error === 'object' && error !== null && 'code' in error) {
+    const code: unknown = error.code
+    if (typeof code === 'string') return code
+  }
+  return null
+}
+
+function printSummary(stats: Stats, palette: Palette): void {
+  const label = (text: string): string => text.padEnd(22)
+  const count = (value: number): string => palette.strong(String(value).padStart(9))
+
+  write('')
+  write(palette.head('SUMMARY'))
+  write(`${label('lines read')}${count(stats.totalLines)}`)
+
+  const matchedTotal = EVENT_TYPES.reduce((sum, type) => sum + stats.matched[type], 0)
+  write(`${label('matched')}${count(matchedTotal)}`)
+  for (const type of EVENT_TYPES) {
+    write(`${label(`  ${type}`)}${count(stats.matched[type])}`)
+  }
+
+  write(`${label('unmatched')}${count(stats.unmatched)}`)
+  write(`${label('  no envelope')}${count(stats.envelopeFailures)}`)
+
+  write('')
+  if (stats.totalLines === 0) {
+    // Distinguished from "everything matched": zero lines means the file was
+    // missing, empty, or already fully consumed - not that the patterns are
+    // perfect. Conflating the two would be the most misleading thing this
+    // summary could possibly say.
+    write(palette.note('no lines were read - nothing to report'))
+    return
+  }
+  if (stats.shapes.size === 0) {
+    write(palette.note('every line matched a pattern - no unmatched shapes to report'))
+    return
+  }
+
+  const shown = Math.min(TOP_SHAPE_COUNT, stats.shapes.size)
+  const heading = `TOP ${String(shown)} UNMATCHED SHAPE${shown === 1 ? '' : 'S'}`
+  write(palette.head(heading) + palette.raw(` (of ${String(stats.shapes.size)} distinct)`))
+  for (const [shape, occurrences] of topShapes(stats.shapes, TOP_SHAPE_COUNT)) {
+    write(`${palette.strong(String(occurrences).padStart(9))}  ${shape}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Path resolution
+// ---------------------------------------------------------------------------
+
+type PathResult =
+  | { readonly kind: 'path'; readonly path: string; readonly autodetected: boolean }
+  | { readonly kind: 'error'; readonly message: string }
+
+/**
+ * Resolves the log path: explicit `--path` wins, otherwise autodetect.
+ *
+ * The failure message is the important part. Autodetect cannot find a Steam
+ * install on a second drive (see the notes in `default-paths.ts`), so failing is
+ * a NORMAL outcome and the message has to leave the user able to act: it lists
+ * every candidate that was tried, and on a machine that is not Windows it says so
+ * explicitly rather than printing a confusing empty list.
+ */
+async function resolveLogPath(options: CliOptions): Promise<PathResult> {
+  if (options.path !== null) {
+    return { kind: 'path', path: options.path, autodetected: false }
+  }
+
+  const found = await autodetectLogPath(process.env, fileExists)
+  const first = found[0]
+  if (first !== undefined) {
+    return { kind: 'path', path: first, autodetected: true }
+  }
+
+  const tried = candidateLogPaths(process.env)
+  const detail =
+    tried.length === 0
+      ? [
+          'No candidate paths could even be built: this machine defines none of',
+          '%ProgramFiles(x86)%, %ProgramFiles% or %ProgramW6432%, which is expected',
+          'anywhere that is not Windows.'
+        ].join('\n')
+      : ['Tried these paths, none of which exist:', ...tried.map((path) => `  ${path}`)].join('\n')
+
+  return {
+    kind: 'error',
+    message: [
+      'could not find Client.txt automatically.',
+      '',
+      detail,
+      '',
+      'Pass it explicitly, e.g.:',
+      '  npm run tail:debug -- --path="C:\\Program Files (x86)\\Steam\\steamapps\\common\\Path of Exile\\logs\\Client.txt"'
+    ].join('\n')
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Interruptible sleep
+// ---------------------------------------------------------------------------
+
+/**
+ * Poll interval between reads while following, taken from the app's own default
+ * so the CLI's timing matches what production will do.
+ */
+const POLL_INTERVAL_MS = DEFAULT_SETTINGS.log.pollIntervalMs
+
+/** Set by SIGINT. The read loop checks it and unwinds normally. */
+let stopRequested = false
+/** Resolves the in-flight {@link sleep} early. `null` when not sleeping. */
+let wakeSleeper: (() => void) | null = null
+
+/**
+ * `setTimeout` as a promise, cancellable by {@link requestStop}.
+ *
+ * Ctrl-C during a 500ms nap must not wait out the nap: the handler resolves this
+ * immediately, the loop sees `stopRequested`, and the summary prints. Doing it
+ * this way (rather than printing the summary from inside the signal handler)
+ * means the summary is always produced by exactly one code path, so it can never
+ * print twice or print while a read is half-finished.
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise<void>((resolvePromise) => {
+    const timer = setTimeout(() => {
+      wakeSleeper = null
+      resolvePromise()
+    }, ms)
+
+    wakeSleeper = (): void => {
+      clearTimeout(timer)
+      wakeSleeper = null
+      resolvePromise()
+    }
+  })
+}
+
+function requestStop(): void {
+  stopRequested = true
+  if (wakeSleeper !== null) wakeSleeper()
+}
+
+// ---------------------------------------------------------------------------
+// The read loop
+// ---------------------------------------------------------------------------
+
+/** Human-readable note for a non-`ok` read result. */
+function statusNote(result: LogReadResult): string {
+  const code = result.code === undefined ? '' : ` [${result.code}]`
+  const message = result.error ?? 'unknown error'
+  return result.status === 'file-missing'
+    ? `file is not there right now${code}: ${message}`
+    : `read error${code}: ${message}`
+}
+
+/**
+ * Reads the file and prints a line per input line, until the file drains (when
+ * not following), the `--limit` is hit, or Ctrl-C.
+ *
+ * @returns The process exit code.
+ */
+async function tail(options: CliOptions, logPath: string, stats: Stats, palette: Palette): Promise<number> {
+  const reader = new LogReader(logPath)
+  const note = (text: string): void => write(palette.note(`--  ${text}`))
+
+  if (!options.replay) {
+    const seek = await reader.seekToEnd()
+    if (seek.status !== 'ok') {
+      note(statusNote(seek))
+      note('nothing to tail; pass --path=<file> or start the game')
+      return 1
+    }
+    note(`skipped ${String(reader.offset)} existing bytes - use --replay to read them`)
+  }
+
+  /** True while we are draining bytes that already existed before we attached. */
+  let draining = options.replay
+  /** Last reported status, so a missing file is announced once, not every 500ms. */
+  let lastStatus: LogReadStatus | null = null
+
+  while (!stopRequested) {
+    const result = await reader.readDelta()
+
+    if (result.status !== 'ok') {
+      if (result.status !== lastStatus) note(statusNote(result))
+      lastStatus = result.status
+      if (!options.follow) return 1
+      await sleep(POLL_INTERVAL_MS)
+      continue
+    }
+
+    if (lastStatus !== null && lastStatus !== 'ok') note('file is readable again')
+    lastStatus = 'ok'
+
+    if (result.rotated) {
+      note('file was truncated or replaced - re-reading from offset 0 (these lines are backlog)')
+    }
+
+    // Pre-existing bytes: the initial replay, or a post-rotation re-read. Copied
+    // onto every event so the printed JSON matches exactly what a production
+    // consumer would receive - and what it would therefore refuse to clip.
+    // `result.backlog` (not `result.rotated`) stays true for the WHOLE drain, which
+    // for a 100MB Client.txt is many capped reads rather than one.
+    const backlog = draining || result.backlog
+    const detectedAt = Date.now()
+
+    let hitLimit = false
+    for (const line of result.lines) {
+      const parsed = parseLine(line, { detectedAt, backlog, selfName: options.charName })
+      record(stats, parsed)
+      printResult(parsed, options, palette)
+
+      if (options.limit !== null && stats.totalLines >= options.limit) {
+        hitLimit = true
+        break
+      }
+    }
+    if (hitLimit) {
+      note(`--limit=${String(options.limit)} reached`)
+      break
+    }
+
+    if (result.bytesRead === 0) {
+      if (draining) {
+        draining = false
+        if (options.follow) note('backlog drained - following live writes (Ctrl-C to stop)')
+      }
+      if (!options.follow) break
+    }
+
+    // Read again immediately while there is definitely more to consume: during
+    // the initial drain, and whenever LogReader's per-read byte cap engaged
+    // (which means the file has more waiting right now). Otherwise pace the loop
+    // at the poll interval so a live tail is not a spin loop.
+    const capEngaged = result.bytesRead >= DEFAULT_MAX_BYTES_PER_READ
+    const moreWaiting = capEngaged || (draining && result.bytesRead > 0)
+    if (!moreWaiting) await sleep(POLL_INTERVAL_MS)
+  }
+
+  return 0
+}
+
+/** Applies `--filter` / `--unmatched-only` and prints, or prints nothing. */
+function printResult(result: ParseResult, options: CliOptions, palette: Palette): void {
+  if (result.type === 'unmatched') {
+    if (options.filter !== null) return
+    write(formatUnmatched(result.raw, palette))
+    return
+  }
+
+  if (options.unmatchedOnly) return
+  if (options.filter !== null && options.filter !== result.type) return
+  write(formatMatch(result, palette))
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<number> {
+  const parsed = parseArgv(process.argv.slice(2))
+
+  if (parsed.kind === 'help') {
+    write(USAGE)
+    return 0
+  }
+  if (parsed.kind === 'error') {
+    write(`tail:debug: ${parsed.message}`)
+    write('')
+    write(USAGE)
+    return 1
+  }
+
+  const options = parsed.options
+  const palette = makePalette(process.stdout.isTTY === true)
+
+  const located = await resolveLogPath(options)
+  if (located.kind === 'error') {
+    write(`tail:debug: ${located.message}`)
+    return 1
+  }
+
+  // Banner: every decision this run is operating under, before a single line of
+  // output. When the user pastes their output into a bug report, this is the
+  // context that makes it interpretable.
+  const mode = options.replay ? (options.follow ? 'replay from start, then follow' : 'replay from start') : 'live tail from end'
+  const showing =
+    options.unmatchedOnly
+      ? 'unmatched lines only'
+      : options.filter !== null
+        ? `${options.filter} events only`
+        : 'everything'
+
+  write(`${palette.strong('tail:debug')}  ${located.path}${located.autodetected ? palette.raw('  (autodetected)') : ''}`)
+  write(`${palette.raw('mode      ')} ${mode}`)
+  write(
+    `${palette.raw('character ')} ${options.charName.trim() === '' ? palette.raw('(not set - isSelf is always false)') : options.charName}`
+  )
+  write(`${palette.raw('showing   ')} ${showing}${options.limit === null ? '' : `, first ${String(options.limit)} lines`}`)
+  write(palette.raw('the log file is opened READ ONLY; nothing is ever written to it'))
+  write('')
+
+  const stats = newStats()
+  const exitCode = await tail(options, located.path, stats, palette)
+  printSummary(stats, palette)
+  return exitCode
+}
+
+// Piping into `head` closes stdout early; that is a normal way to use this tool,
+// not a crash. Node would otherwise surface it as an unhandled EPIPE error.
+process.stdout.on('error', (error: Error): void => {
+  if (errorCodeOf(error) === 'EPIPE') process.exit(0)
+})
+
+// First Ctrl-C unwinds the loop so the summary prints from its single normal
+// code path. A second one means the user is not willing to wait for an in-flight
+// read (a spun-down or network drive), so exit hard.
+let interrupts = 0
+process.on('SIGINT', () => {
+  interrupts += 1
+  if (interrupts === 1) {
+    requestStop()
+    return
+  }
+  process.exit(130)
+})
+
+void main().then(
+  (code) => {
+    // `exitCode` rather than `process.exit()`: stdout writes to a pipe are async,
+    // and exiting immediately would truncate the summary.
+    process.exitCode = code
+  },
+  (error: unknown) => {
+    // Nothing in main() is expected to throw - LogReader and parseLine are both
+    // total. If something does, print it rather than dying with a bare stack.
+    write(`tail:debug: unexpected failure: ${error instanceof Error ? error.message : String(error)}`)
+    process.exitCode = 1
+  }
+)
