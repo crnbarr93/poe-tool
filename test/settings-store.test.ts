@@ -42,10 +42,15 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true })
 })
 
-function makeStore(overrides: { dir?: string; defaultLibraryDir?: string } = {}): SettingsStore {
+function makeStore(
+  overrides: { dir?: string; defaultLibraryDir?: string; homeDir?: string } = {}
+): SettingsStore {
   return new SettingsStore({
     dir: overrides.dir ?? dir,
-    defaultLibraryDir: overrides.defaultLibraryDir ?? LIBRARY_DIR
+    defaultLibraryDir: overrides.defaultLibraryDir ?? LIBRARY_DIR,
+    // Spread rather than pass `undefined`: `homeDir` is an optional property and
+    // `exactOptionalPropertyTypes` rejects an explicit undefined.
+    ...(overrides.homeDir === undefined ? {} : { homeDir: overrides.homeDir })
   })
 }
 
@@ -512,5 +517,75 @@ describe('SettingsStore.save - atomicity', () => {
     // diverge from the settings file.
     expect(store.get()).toEqual(before)
     expect(readdirSync(dir)).toEqual(['blocked'])
+  })
+})
+
+/**
+ * A leading `~` is a SHELL convention, so node opens a directory literally named `~`
+ * and reports ENOENT against a path the user is certain exists. This was hit for real
+ * while running the app: pasting `~/Downloads/Client.txt` into the log path field gave
+ * "ENOENT: no such file or directory, open '~/Downloads/Client.txt'".
+ */
+describe('home directory expansion', () => {
+  const HOME = join('/', 'Users', 'someone')
+
+  it('expands a leading ~/ in log.path', () => {
+    const store = makeStore({ homeDir: HOME })
+    const next = store.save({ log: { path: '~/Downloads/Client.txt' } })
+    expect(next.log.path).toBe(join(HOME, 'Downloads', 'Client.txt'))
+  })
+
+  it('expands a leading ~/ in clips.libraryDir', () => {
+    const store = makeStore({ homeDir: HOME })
+    const next = store.save({ clips: { libraryDir: '~/Movies/clips' } })
+    expect(next.clips.libraryDir).toBe(join(HOME, 'Movies', 'clips'))
+  })
+
+  it('expands a bare ~ to the home directory itself', () => {
+    const store = makeStore({ homeDir: HOME })
+    expect(store.save({ log: { path: '~' } }).log.path).toBe(HOME)
+  })
+
+  it('expands on load, not just on save', () => {
+    writeFileSync(
+      join(dir, SETTINGS_FILE_NAME),
+      JSON.stringify({ log: { path: '~/Downloads/Client.txt' } }),
+      'utf8'
+    )
+    expect(makeStore({ homeDir: HOME }).load().log.path).toBe(
+      join(HOME, 'Downloads', 'Client.txt')
+    )
+  })
+
+  it('leaves an absolute path untouched', () => {
+    const absolute = join('/', 'Users', 'connorbarr', 'Downloads', 'Client.txt')
+    const store = makeStore({ homeDir: HOME })
+    expect(store.save({ log: { path: absolute } }).log.path).toBe(absolute)
+  })
+
+  it('leaves a ~ that is not leading untouched', () => {
+    // Windows 8.3 short names legitimately contain ~, e.g. C:\temp\file~1.txt.
+    const windowsShortName = 'C:\\temp\\file~1.txt'
+    const store = makeStore({ homeDir: HOME })
+    expect(store.save({ log: { path: windowsShortName } }).log.path).toBe(windowsShortName)
+  })
+
+  it('leaves ~user verbatim rather than guessing', () => {
+    // Resolving ~otheruser needs the passwd database; guessing would silently watch
+    // the wrong file, so the error should name what was actually opened.
+    const store = makeStore({ homeDir: HOME })
+    expect(store.save({ log: { path: '~root/Client.txt' } }).log.path).toBe('~root/Client.txt')
+  })
+
+  it('leaves null log.path as null', () => {
+    const store = makeStore({ homeDir: HOME })
+    expect(store.save({ log: { path: null } }).log.path).toBeNull()
+  })
+
+  it('disables expansion when homeDir is empty', () => {
+    const store = makeStore({ homeDir: '' })
+    expect(store.save({ log: { path: '~/Downloads/Client.txt' } }).log.path).toBe(
+      '~/Downloads/Client.txt'
+    )
   })
 })
