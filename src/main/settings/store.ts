@@ -52,6 +52,7 @@ import {
   unlinkSync,
   writeFileSync
 } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 import {
@@ -63,6 +64,30 @@ import {
 
 /** File name inside {@link SettingsStoreOptions.dir}. Hand-editable by design. */
 export const SETTINGS_FILE_NAME = 'settings.json'
+
+/**
+ * Expands a leading `~` to `homeDir`.
+ *
+ * Nothing in node does this: `~` is a SHELL convention, so `fs.open('~/x')` looks for
+ * a directory literally named `~` and fails with a baffling ENOENT that names a path
+ * the user believes exists. People paste `~/...` into the path field anyway, so the
+ * app expands it rather than blaming them.
+ *
+ * Only a LEADING `~` followed by a separator (or the whole string) is expanded, so a
+ * legitimate path containing `~` elsewhere - `C:\temp\file~1.txt`, a Windows 8.3
+ * short name - is untouched. `~user` (another shell form) is NOT supported: resolving
+ * it needs the passwd database, and getting it wrong would silently watch the wrong
+ * file. It is left verbatim so the resulting error names what was actually opened.
+ *
+ * Windows paths never start with `~`, so this is a no-op there.
+ */
+export function expandHomePath(value: string, homeDir: string): string {
+  if (value !== '~' && !value.startsWith('~/') && !value.startsWith('~\\')) return value
+  if (homeDir === '') return value
+  const rest = value.slice(1)
+  if (rest === '') return homeDir
+  return join(homeDir, rest.slice(1))
+}
 
 /** Everything the store needs from the host application. */
 export interface SettingsStoreOptions {
@@ -84,6 +109,13 @@ export interface SettingsStoreOptions {
    * clip library must treat it as unconfigured.
    */
   readonly defaultLibraryDir: string
+  /**
+   * Home directory used to expand a leading `~` in `log.path` and `clips.libraryDir`.
+   *
+   * Injected so tests can assert expansion without depending on the machine they run
+   * on. Defaults to `os.homedir()`. Pass `""` to disable expansion entirely.
+   */
+  readonly homeDir?: string
 }
 
 /**
@@ -100,6 +132,7 @@ export interface SettingsStoreOptions {
 export class SettingsStore {
   readonly #dir: string
   readonly #defaultLibraryDir: string
+  readonly #homeDir: string
   readonly #filePath: string
   /**
    * Scratch file for the write-then-rename dance.
@@ -116,6 +149,7 @@ export class SettingsStore {
   constructor(options: SettingsStoreOptions) {
     this.#dir = options.dir
     this.#defaultLibraryDir = options.defaultLibraryDir
+    this.#homeDir = options.homeDir ?? homedir()
     this.#filePath = join(options.dir, SETTINGS_FILE_NAME)
     this.#tmpPath = join(options.dir, `${SETTINGS_FILE_NAME}.${process.pid}.tmp`)
     this.#current = this.#resolve(undefined)
@@ -218,11 +252,19 @@ export class SettingsStore {
    */
   #resolve(input: unknown): AppSettings {
     const validated = validateSettings(input)
-    if (validated.clips.libraryDir.trim() !== '') return validated
-    if (this.#defaultLibraryDir === '') return validated
+    const libraryDir =
+      validated.clips.libraryDir.trim() === '' ? this.#defaultLibraryDir : validated.clips.libraryDir
+
     return {
       ...validated,
-      clips: { ...validated.clips, libraryDir: this.#defaultLibraryDir }
+      log: {
+        ...validated.log,
+        // Expanded HERE rather than at each consumer so `log.path` is absolute for
+        // everyone downstream - watcher, name scan, and the "currently watching"
+        // readout in the UI, which should show the path actually being opened.
+        path: validated.log.path === null ? null : expandHomePath(validated.log.path, this.#homeDir)
+      },
+      clips: { ...validated.clips, libraryDir: expandHomePath(libraryDir, this.#homeDir) }
     }
   }
 
