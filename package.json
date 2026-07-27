@@ -1,7 +1,7 @@
 {
   "name": "poe-tool",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Windows companion app for Path of Exile: read-only Client.txt tailing + OBS replay-buffer clipping.",
   "main": "./out/main/index.js",
   "scripts": {
