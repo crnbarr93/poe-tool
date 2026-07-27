@@ -1,0 +1,28 @@
+{
+  // Real-emit config for the `tail:debug` CLI. Only includes trees that never import electron.
+  // NOTE: "moduleResolution": "node" (node10) was REMOVED in TypeScript 7 and is now a hard
+  // error (TS5108). Omitting the key lets it default to the correct classic-CJS resolution for
+  // "module": "commonjs", which still allows extensionless relative imports. Do not re-add it.
+  "compilerOptions": {
+    "module": "commonjs",
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "rootDir": "src",
+    "outDir": "dist-tools",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/shared/**/*",
+    "src/main/log/**/*",
+    "src/main/events/**/*",
+    "src/main/tools/**/*"
+  ]
+}
