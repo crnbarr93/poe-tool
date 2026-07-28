@@ -49,6 +49,20 @@ Nothing yet.
   could possibly be saved. Readiness is now computed in one place that feeds both the
   pill and the banners, so they cannot disagree.
 
+### Fixed — release pipeline
+
+- Tagging produced **two** draft releases with the assets split across them.
+  electron-builder runs one publisher per artifact and each independently decided
+  the release did not exist yet, so two were created 120ms apart. The release is
+  now created up front, so every publisher uploads into the same one, and the run
+  asserts afterwards that exactly one release exists carrying all three assets.
+  This affected 0.2.0 too, whose published release has no `.blockmap` — updates
+  from it fall back to a full download rather than a delta.
+- Release notes were applied with `gh release edit <tag>`, but a draft release has
+  no real tag, so that matched an `untagged-…` pseudo-tag and wrote the notes to
+  whichever duplicate it happened to pick. The body is now set when the release is
+  created.
+
 ### Not implemented
 
 The overlay, logout macro, area timers and notifications are visible in the UI as

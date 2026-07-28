@@ -207,6 +207,59 @@ jobs:
       # release was actually published and is not still sitting in drafts.
       # To make publishing fully automatic instead, set `releaseType: release`
       # under `publish:` in electron-builder.yml.
+      # CREATE THE RELEASE FIRST. This is not a nicety - it fixes a real race.
+      #
+      # electron-builder spawns one publisher per artifact and each one does
+      # "does a release for this tag exist? no -> create it". Observed in run
+      # 30337748629, where two publishers both answered "no" 120ms apart:
+      #
+      #   • creating GitHub release  reason=release doesn't exist tag=v0.3.0
+      #   • creating GitHub release  reason=release doesn't exist tag=v0.3.0
+      #
+      # The result was TWO draft releases for one tag with the assets split across
+      # them - the .exe and latest.yml on one, the .blockmap on the other. That is
+      # not cosmetic: electron-updater reads latest.yml and then looks for the
+      # .blockmap beside the installer to do a differential download, so a split
+      # release silently degrades every update to a full ~96 MB fetch. The same
+      # thing happened to v0.2.0, whose surviving release has no .blockmap at all.
+      #
+      # Creating the release up front removes the "doesn't exist" branch entirely:
+      # both publishers find it and upload into the same one.
+      #
+      # It also fixes a second bug. The notes used to be applied afterwards with
+      # `gh release edit <tag>`, but a DRAFT release has no real tag, so gh matched
+      # an "untagged-beb71451f7c16fe30bcf" pseudo-tag and wrote the notes to
+      # whichever twin it happened to pick. Setting the body at creation is
+      # deterministic.
+      #
+      # --draft is explicit: publishing stays a human decision. Flip it (and
+      # `releaseType` in electron-builder.yml) only if tags should go live directly.
+      - name: Create draft release with CHANGELOG notes
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          pkg="$(node -p "require('./package.json').version")"
+
+          # Idempotent: a re-run of the same tag must reuse the release rather than
+          # adding another twin, which is the very failure this step exists to stop.
+          existing="$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq "[.[] | select(.tag_name == \"${GITHUB_REF_NAME}\")] | length")"
+
+          if [ "$existing" != "0" ]; then
+            echo "A release for ${GITHUB_REF_NAME} already exists; reusing it."
+            exit 0
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$pkg" \
+            --notes-file release-notes.md \
+            --target "$GITHUB_SHA"
+          echo "Created draft release ${GITHUB_REF_NAME} with notes from CHANGELOG.md."
+
       - name: Package and publish installer to GitHub Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         run: npx electron-builder --win --publish always
@@ -215,22 +268,39 @@ jobs:
           # publish provider. Paired with `permissions: contents: write` above.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # electron-builder creates the Release with an EMPTY body, so the notes are
-      # applied afterwards from CHANGELOG.md. `gh release edit` addresses the release
-      # by tag and works on a draft, which is what electron-builder leaves behind.
+      # ASSET AUDIT. The race this pipeline just learned about was invisible from
+      # inside a green run: both duplicate releases existed, both looked fine
+      # individually, and only counting the assets on one of them revealed the split.
+      # So the run now asserts what it produced instead of assuming it.
       #
-      # `--draft=true` is passed explicitly so this step cannot accidentally publish a
-      # release that the pipeline deliberately left in drafts: editing notes must not
-      # be the thing that makes a build visible to auto-update clients.
-      - name: Apply CHANGELOG notes to the GitHub Release
+      # A missing .blockmap is the quiet one - the release still installs and still
+      # updates, it just silently downloads ~96 MB every time instead of a delta.
+      - name: Verify the release has exactly one entry and all three assets
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release edit "$GITHUB_REF_NAME" --notes-file release-notes.md --draft=true
-          echo "Release notes applied to $GITHUB_REF_NAME."
+          releases="$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq "[.[] | select(.tag_name == \"${GITHUB_REF_NAME}\")] | length")"
+          if [ "$releases" != "1" ]; then
+            echo "::error::${releases} releases exist for ${GITHUB_REF_NAME}; expected exactly 1. The duplicate-release race is back - check the 'creating GitHub release' lines in the publish step."
+            exit 1
+          fi
+
+          assets="$(gh api "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq "[.[] | select(.tag_name == \"${GITHUB_REF_NAME}\")][0].assets[].name")"
+          echo "Assets on ${GITHUB_REF_NAME}:"
+          echo "$assets"
+
+          for want in '.exe' '.exe.blockmap' 'latest.yml'; do
+            if ! printf '%s\n' "$assets" | grep -qF -- "$want"; then
+              echo "::error::release ${GITHUB_REF_NAME} is missing an asset matching '${want}'. Without the blockmap, electron-updater falls back to a full download for every update."
+              exit 1
+            fi
+          done
+          echo "Release ${GITHUB_REF_NAME} looks complete."
 
       # ---- MANUAL DISPATCH: package only, publish nothing ---------------------
       - name: Package installer without publishing
