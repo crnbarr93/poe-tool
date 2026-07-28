@@ -1,7 +1,7 @@
 {
   "name": "poe-tool",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Windows companion app for Path of Exile: read-only Client.txt tailing + OBS replay-buffer clipping.",
   "main": "./out/main/index.js",
   "scripts": {
@@ -15,6 +15,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "tail:debug": "tsc -p tsconfig.tools.json && node dist-tools/main/tools/tail-debug.js",
+    "changelog:section": "tsc -p tsconfig.tools.json && node dist-tools/main/tools/changelog.js",
     "package:win": "npm run build && electron-builder --win --x64 --publish never",
     "package:dir": "npm run build && electron-builder --win --x64 --dir --publish never"
   },

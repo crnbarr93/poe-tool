@@ -128,6 +128,7 @@ function subscribe<C extends IpcPushChannel>(
  * them.
  */
 const api: PoeToolApi = {
+  getAppVersion: () => invoke(IPC_INVOKE.APP_VERSION),
   getSettings: () => invoke(IPC_INVOKE.SETTINGS_GET),
   setSettings: (patch) => invoke(IPC_INVOKE.SETTINGS_SET, patch),
   testObs: (params) => invoke(IPC_INVOKE.OBS_TEST, params),
@@ -147,6 +148,7 @@ const api: PoeToolApi = {
   // `src/shared/ipc.ts`.
   testStreamable: (params) => invoke(IPC_INVOKE.STREAMABLE_TEST, params),
   getCredentialStatus: () => invoke(IPC_INVOKE.CREDENTIALS_STATUS),
+  getSessionStats: () => invoke(IPC_INVOKE.STATS_SESSION),
 
   onEvent: (listener) => subscribe(IPC_PUSH.EVENT, listener),
   onStatus: (listener) => subscribe(IPC_PUSH.STATUS, listener),
@@ -154,7 +156,8 @@ const api: PoeToolApi = {
   onClip: (listener) => subscribe(IPC_PUSH.CLIP, listener),
   onClipUpload: (listener) => subscribe(IPC_PUSH.CLIP_UPLOAD, listener),
   onCharacter: (listener) => subscribe(IPC_PUSH.CHARACTER, listener),
-  onUpdate: (listener) => subscribe(IPC_PUSH.UPDATE, listener)
+  onUpdate: (listener) => subscribe(IPC_PUSH.UPDATE, listener),
+  onSessionStats: (listener) => subscribe(IPC_PUSH.STATS, listener)
 }
 
 // Not wrapped in a try/catch: `exposeInMainWorld` only throws when

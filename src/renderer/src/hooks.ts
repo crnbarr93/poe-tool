@@ -43,6 +43,7 @@ import type {
   CredentialsStatusResult,
   ObsConnectionState,
   PoeToolApi,
+  SessionStatsSnapshot,
   UpdateState
 } from '../../shared/ipc'
 import type { AppSettings, DeepPartial } from '../../shared/settings'
@@ -90,6 +91,48 @@ export function getBridge(): PoeToolApi | null {
 
   cachedBridge = api
   return cachedBridge
+}
+
+// ---------------------------------------------------------------------------
+// App identity
+// ---------------------------------------------------------------------------
+
+/**
+ * The running app's version, e.g. `"0.2.0"`, or `null` until it is known.
+ *
+ * ASKED ONCE, AND NULL IS A REAL ANSWER. `null` covers both "the reply has not arrived
+ * yet" and "asking failed", and the caller renders NOTHING in that state. That is
+ * deliberate: the sidebar's version line exists so a user can quote the right build in a
+ * bug report, and a placeholder that looks like a version - a dash, a `0.0.0`, the string
+ * the design mocked up with - is worse than no line at all.
+ *
+ * There is no push channel for this and there should not be: the version of a running
+ * process cannot change while it runs. An update that has been downloaded installs on
+ * quit, and the number here stays true until then.
+ */
+export function useAppVersion(api: PoeToolApi): string | null {
+  const [version, setVersion] = useState<string | null>(null)
+
+  useEffect(() => {
+    let active = true
+
+    void api.getAppVersion().then(
+      (value) => {
+        // `''` is main's documented "could not be read" answer; it collapses into the same
+        // "say nothing" state as a failed call rather than rendering an empty gap.
+        if (active) setVersion(value === '' ? null : value)
+      },
+      (error: unknown) => {
+        console.warn('poe-tool: app:version failed', describeError(error))
+      }
+    )
+
+    return () => {
+      active = false
+    }
+  }, [api])
+
+  return version
 }
 
 // ---------------------------------------------------------------------------
@@ -292,8 +335,12 @@ export function useActiveCharacter(api: PoeToolApi): ActiveCharacter | null {
   return character
 }
 
-/** What {@link useDetectionSwap} returns. */
-export interface DetectionSwapNotice {
+/**
+ * What {@link useDetectionSwap} returns.
+ *
+ * NOT the component of a similar name - `components/DetectionSwapNotice.tsx` renders this.
+ */
+export interface DetectionSwapView {
   /** The unacknowledged swap, or `null` when there is nothing to say. */
   readonly swap: DetectionSwap | null
   /** Acknowledge it. Changes no settings - see {@link dismissDetectionSwap}. */
@@ -311,8 +358,14 @@ export interface DetectionSwapNotice {
  * All the logic is in the pure reducer; this hook is just the memory. It re-derives
  * nothing about WHO is active: `character` is main's answer, arriving on
  * `push:character` through {@link useActiveCharacter}.
+ *
+ * MOUNT IT IN THE SHELL, FOR THE LIFE OF THE WINDOW - never inside a view or a tab. The
+ * reducer diffs two CONSECUTIVE values seen while this hook is mounted, so a swap that
+ * lands while the component holding it is unmounted is not merely missed: the next mount
+ * seeds `seen` straight to the new character and no warning is ever produced for it.
+ * `App.tsx` is the only correct home. See `./detection-swap.ts`.
  */
-export function useDetectionSwap(character: ActiveCharacter | null): DetectionSwapNotice {
+export function useDetectionSwap(character: ActiveCharacter | null): DetectionSwapView {
   const [state, setState] = useState<DetectionSwapState>(INITIAL_DETECTION_SWAP_STATE)
 
   useEffect(() => {
@@ -469,6 +522,54 @@ export function useUpdateState(api: PoeToolApi): UpdateState | null {
   }, [api])
 
   return state
+}
+
+/**
+ * This session's counters - areas entered, deaths, suicides, the character's level and
+ * when main started counting. `null` until the first answer arrives, and `null` for good
+ * if main could not read them.
+ *
+ * NULL IS NOT ZERO, AND THE CALLER MUST NOT COLLAPSE THE TWO. `stats:session` resolves
+ * with `null` to mean "could not be read"; a UI that rendered that as `0` would be
+ * claiming nothing has happened this session, which is exactly the confident falsehood
+ * that lets a broken counter pass for a quiet evening. Render an em-dash instead - see
+ * `views/ActivityView.tsx`.
+ *
+ * NOT A CLOCK. `SessionStatsSnapshot.uptimeMs` is stale the instant it arrives and there
+ * is deliberately no push for time passing; a view that wants a ticking session length
+ * runs its own interval over `startedAt`. `push:stats` fires only when a counter actually
+ * moves, so this is silent for minutes at a time.
+ *
+ * Subscribe-then-fetch with `prev ?? seeded`, like every other live hook here: a death
+ * counted in the gap between the fetch being issued and resolving must not be overwritten
+ * by the older snapshot it beat.
+ */
+export function useSessionStats(api: PoeToolApi): SessionStatsSnapshot | null {
+  const [stats, setStats] = useState<SessionStatsSnapshot | null>(null)
+
+  useEffect(() => {
+    let active = true
+
+    const unsubscribe = api.onSessionStats((next) => {
+      if (active) setStats(next)
+    })
+
+    void api.getSessionStats().then(
+      (seeded) => {
+        if (active) setStats((prev) => prev ?? seeded)
+      },
+      (error: unknown) => {
+        console.warn('poe-tool: stats:session failed', describeError(error))
+      }
+    )
+
+    return () => {
+      active = false
+      unsubscribe()
+    }
+  }, [api])
+
+  return stats
 }
 
 /**

@@ -22,7 +22,7 @@ import { POLL_INTERVAL_MS_MAX, POLL_INTERVAL_MS_MIN } from '../../../shared/sett
 import { describeError, formatBytes, formatCount, formatEpochClock } from '../format'
 import { useWatcherStatus } from '../hooks'
 import { NumberField, TextField } from './Fields'
-import { Section } from './Section'
+import { Panel } from './Panel'
 import type { BadgeDescriptor } from './StatusBadge'
 import { StatusBadge } from './StatusBadge'
 
@@ -109,8 +109,7 @@ export function LogSourceSection({
   }
 
   return (
-    <Section
-      index="1"
+    <Panel
       title="Log source"
       description="poe-tool only ever READS this file. It never writes to the game, reads its memory, or sends it input."
       aside={<StatusBadge {...badge} srPrefix="Log watcher" />}
@@ -123,7 +122,12 @@ export function LogSourceSection({
       </div>
 
       <div className="row">
-        <button className="button" type="button" onClick={runAutodetect} disabled={detecting}>
+        <button
+          className="btn btn-secondary"
+          type="button"
+          onClick={runAutodetect}
+          disabled={detecting}
+        >
           {detecting ? 'Searching…' : 'Auto-detect Client.txt'}
         </button>
         <span className="row__note">Checks the usual Steam, standalone and Epic install folders.</span>
@@ -190,6 +194,6 @@ export function LogSourceSection({
           onCommit={flush}
         />
       </div>
-    </Section>
+    </Panel>
   )
 }

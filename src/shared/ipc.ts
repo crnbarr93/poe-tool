@@ -60,6 +60,7 @@ import type { AppSettings, DeepPartial } from './settings'
  * literal at a call site.
  */
 export const IPC_INVOKE = {
+  APP_VERSION: 'app:version',
   SETTINGS_GET: 'settings:get',
   SETTINGS_SET: 'settings:set',
   OBS_TEST: 'obs:test',
@@ -72,7 +73,8 @@ export const IPC_INVOKE = {
   CHARACTER_SUGGESTIONS: 'character:suggestions',
   UPDATE_STATE: 'update:state',
   STREAMABLE_TEST: 'streamable:test',
-  CREDENTIALS_STATUS: 'credentials:status'
+  CREDENTIALS_STATUS: 'credentials:status',
+  STATS_SESSION: 'stats:session'
 } as const
 
 /**
@@ -89,13 +91,14 @@ export const IPC_PUSH = {
   CLIP: 'push:clip',
   CLIP_UPLOAD: 'push:clip-upload',
   CHARACTER: 'push:character',
-  UPDATE: 'push:update'
+  UPDATE: 'push:update',
+  STATS: 'push:stats'
 } as const
 
-/** Union of the thirteen invoke channel names. */
+/** Union of the fifteen invoke channel names. */
 export type IpcInvokeChannel = (typeof IPC_INVOKE)[keyof typeof IPC_INVOKE]
 
-/** Union of the seven push channel names. */
+/** Union of the eight push channel names. */
 export type IpcPushChannel = (typeof IPC_PUSH)[keyof typeof IPC_PUSH]
 
 // ---------------------------------------------------------------------------
@@ -565,6 +568,105 @@ export interface CredentialsStatusResult {
 }
 
 // ---------------------------------------------------------------------------
+// Session stats
+// ---------------------------------------------------------------------------
+
+/**
+ * WHAT THIS SESSION HAS ACTUALLY SEEN, counted live in main.
+ *
+ * Produced by `src/main/stats/session-stats.ts`, which subscribes to the same bus the
+ * rest of the app runs on and increments a counter per event. Sent whole on
+ * `push:stats` whenever a counter (or the character's level) moves, and readable at any
+ * time over `stats:session`.
+ *
+ *
+ * COUNTED LIVE - NOT DERIVED FROM `events:recent`
+ * -----------------------------------------------
+ * The obvious implementation is to count deaths in the `events:recent` ring buffer,
+ * and it is wrong. That buffer is capped at 200 events against a stream dominated by
+ * zone traffic, so an evening's mapping pushes the session's early deaths out of it and
+ * the "Deaths" figure would quietly walk BACKWARDS while the user played - the exact
+ * class of silent wrongness this app exists to avoid. These counters only ever go up.
+ *
+ *
+ * BACKLOG IS NOT COUNTED
+ * ----------------------
+ * Lines that already existed in Client.txt when we attached (startup catch-up, a
+ * post-rotation re-read) carry `PoeEventBase.backlog`, and none of them are counted:
+ * this is "your session", not "your log file". Without that rule, PoE truncating
+ * Client.txt mid-session would replay hours of history and inflate every number at once.
+ *
+ *
+ * THERE IS DELIBERATELY NO "AVERAGE MAP TIME" FIELD
+ * -------------------------------------------------
+ * The design shows one. It is NOT derivable from what this build tracks: an average
+ * needs per-area durations, which need an area-timer that knows when an area was left as
+ * well as entered (a map exited to a hideout, a logout, an alt-tab) - none of which
+ * exists yet. A plausible-looking number computed from `uptimeMs / areasEntered` would be
+ * wrong in a way nobody could see, so the UI renders an em-dash and says the figure
+ * arrives with area timers. Do not add the field until the timers exist.
+ */
+export interface SessionStatsSnapshot {
+  /**
+   * `Date.now()` when main started counting - i.e. when the app launched, not when the
+   * window opened.
+   *
+   * Epoch milliseconds, so a renderer can tick a live "session length" from
+   * `Date.now() - startedAt` without waiting for a push. {@link uptimeMs} is the same
+   * figure as of the moment this snapshot was taken, for callers that would rather not
+   * hold their own timer.
+   */
+  readonly startedAt: number
+  /**
+   * How long main has been counting, in milliseconds, AS OF THIS SNAPSHOT.
+   *
+   * Stale the instant it arrives - there is no push for the clock ticking, because that
+   * would be a once-per-second IPC message for a value the renderer can compute. Clamped
+   * at 0, so an OS clock adjustment during the session cannot produce a negative age.
+   */
+  readonly uptimeMs: number
+  /**
+   * How many areas have been entered this session, counting EVERY `zone-entered`.
+   *
+   * Towns and hideouts included: the line that names a zone carries nothing that
+   * distinguishes them, and inventing a rule ("anything with seed 1 is not an area")
+   * would make this number disagree with the event feed sitting next to it.
+   */
+  readonly areasEntered: number
+  /**
+   * Deaths of the RESOLVED ACTIVE CHARACTER this session - `DeathEvent.isSelf`.
+   *
+   * Party members' deaths are not counted; they are in the event feed, but they are not
+   * yours. With no character resolved, `isSelf` is false for every line and this stays 0
+   * - which is the same condition that leaves the clipper idle, and is why the UI shouts
+   * about it elsewhere.
+   *
+   * INCLUDES SUICIDES. PoE's `/kill` is a real death and `src/shared/events.ts` is
+   * explicit that it counts; {@link suicides} says how many of these were that, so
+   * `deaths - suicides` is the number that could have produced a clip.
+   */
+  readonly deaths: number
+  /**
+   * How many of {@link deaths} were PoE's `/kill` command (`DeathCause` `'suicide'`).
+   *
+   * Tracked separately because those are the deaths the replay clipper deliberately
+   * skips - a `/kill` is thirty seconds of nothing followed by a self-inflicted death -
+   * so this is the honest answer to "why are there fewer clips than deaths".
+   */
+  readonly suicides: number
+  /**
+   * The active character's level as of the last observed level-up, or `null` when it is
+   * not known.
+   *
+   * READ FROM THE CHARACTER TRACKER, never counted here: level-ups are sparse enough
+   * that a level-98 character can play for weeks without producing one, so the tracker's
+   * persisted answer is the only correct source. `null` is ordinary - an override is just
+   * a name the user typed, and no level-up has ever been seen for it.
+   */
+  readonly characterLevel: number | null
+}
+
+// ---------------------------------------------------------------------------
 // Auto-update
 // ---------------------------------------------------------------------------
 
@@ -683,6 +785,21 @@ export type UpdateState =
  */
 export interface IpcInvokeContract {
   /**
+   * The RUNNING APP'S VERSION, e.g. `"0.2.0"` - `app.getVersion()`, which in a packaged
+   * build is the version baked into the installer and in a dev build is the one in
+   * package.json.
+   *
+   * Exists because the window's brand block shows a version, and a version is exactly the
+   * kind of thing that gets hardcoded into a layout and then quietly lies for six
+   * releases. There is one source of truth and this is the channel to it.
+   *
+   * `''` MEANS "COULD NOT BE READ" and the UI must render nothing at all in that case -
+   * not a guess, not a dash pretending to be a number. It is a display string and nothing
+   * may branch on it; the auto-updater compares versions in main, where the comparison
+   * belongs.
+   */
+  'app:version': { readonly args: readonly []; readonly result: string }
+  /**
    * Current validated settings, WITH SECRETS BLANKED - main runs `redactSecrets` from
    * `./settings` over every `AppSettings` it hands out. `streamable.password` is
    * therefore always `''` here and says nothing about whether one is stored; ask
@@ -756,6 +873,18 @@ export interface IpcInvokeContract {
    * CARRIES NO SECRET, only facts about one.
    */
   'credentials:status': { readonly args: readonly []; readonly result: CredentialsStatusResult }
+  /**
+   * What this session has seen: areas entered, deaths, suicides, the character's level
+   * and how long main has been counting. A stored value read straight off the counter,
+   * like `obs:status` and `update:state` - asking costs nothing and starts nothing.
+   *
+   * `null` MEANS "COULD NOT BE READ", and the UI must render nothing rather than zeros in
+   * that state. This is the same rule `app:version`'s `''` follows and it matters more
+   * here: `0` is not the absence of a number, it is the CLAIM that nothing has happened,
+   * and "you have died 0 times" is exactly the kind of confident falsehood that would let
+   * a broken counter pass for a quiet session.
+   */
+  'stats:session': { readonly args: readonly []; readonly result: SessionStatsSnapshot | null }
 }
 
 /** Argument tuple for a given invoke channel. */
@@ -798,6 +927,19 @@ export interface IpcPushContract {
    * in that case, which is what keeps a download from pushing once per network chunk.
    */
   'push:update': UpdateState
+  /**
+   * A session counter moved - an area was entered, a death was counted, or the character's
+   * level changed.
+   *
+   * Carries the COMPLETE snapshot rather than a delta, mirroring `push:character`, so the
+   * renderer replaces its state instead of doing arithmetic that could drift from main's.
+   *
+   * NOT SENT FOR THE CLOCK. `SessionStatsSnapshot.uptimeMs` is stale the moment it
+   * arrives, and pushing once a second so a timer could tick would put a permanent
+   * heartbeat on a channel that is otherwise silent for minutes at a time. The renderer
+   * ticks its own display from `startedAt`.
+   */
+  'push:stats': SessionStatsSnapshot
 }
 
 /** Payload type for a given push channel. */
@@ -822,6 +964,11 @@ export type Unsubscribe = () => void
  * arbitrary channel) and keeps the renderer honest about what main actually offers.
  */
 export interface PoeToolApi {
+  /**
+   * The running app's version for display, or `''` when it could not be read - in which
+   * case the UI shows nothing rather than inventing one.
+   */
+  readonly getAppVersion: () => Promise<string>
   /** Current validated settings, with `streamable.password` blanked. */
   readonly getSettings: () => Promise<AppSettings>
   /**
@@ -858,6 +1005,12 @@ export interface PoeToolApi {
    * Returns facts about secrets, never a secret.
    */
   readonly getCredentialStatus: () => Promise<CredentialsStatusResult>
+  /**
+   * This session's counters, or `null` when main could not answer - in which case the UI
+   * shows nothing rather than zeros. See the channel's note above for why that difference
+   * matters.
+   */
+  readonly getSessionStats: () => Promise<SessionStatsSnapshot | null>
 
   /** Subscribe to live parsed events. Returns an unsubscribe function. */
   readonly onEvent: (listener: (event: PoeEvent) => void) => Unsubscribe
@@ -877,6 +1030,13 @@ export interface PoeToolApi {
   readonly onCharacter: (listener: (character: ActiveCharacter) => void) => Unsubscribe
   /** Subscribe to auto-update state changes. Returns an unsubscribe function. */
   readonly onUpdate: (listener: (state: UpdateState) => void) => Unsubscribe
+  /**
+   * Subscribe to session-counter changes. Returns an unsubscribe function.
+   *
+   * Fires when a counter moves, NOT on a clock tick - a live session timer is the
+   * renderer's own `setInterval` over `SessionStatsSnapshot.startedAt`.
+   */
+  readonly onSessionStats: (listener: (stats: SessionStatsSnapshot) => void) => Unsubscribe
 }
 
 /** The `window` property name the preload bridge writes {@link PoeToolApi} to. */
